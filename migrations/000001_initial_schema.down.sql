@@ -1,0 +1,12 @@
+DROP TRIGGER IF EXISTS audit_outbox_event_id_immutable ON audit_outbox;
+DROP FUNCTION IF EXISTS prevent_audit_outbox_event_id_change();
+DROP TABLE IF EXISTS audit_logs;
+DROP TABLE IF EXISTS audit_outbox;
+DROP TABLE IF EXISTS idempotency_keys;
+DROP TABLE IF EXISTS disbursements;
+DROP TABLE IF EXISTS refresh_sessions;
+DROP TABLE IF EXISTS users;
+DROP TYPE IF EXISTS outbox_delivery_state;
+DROP TYPE IF EXISTS idempotency_state;
+DROP TYPE IF EXISTS disbursement_status;
+DROP TYPE IF EXISTS user_role;
