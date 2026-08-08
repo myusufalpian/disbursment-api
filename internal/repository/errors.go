@@ -58,3 +58,27 @@ func Classify(err error) *Error {
 	}
 	return NewError(ErrorDependency, err)
 }
+
+func IsNotFound(err error) bool {
+	var repoErr *Error
+	if errors.As(err, &repoErr) {
+		return repoErr.Category == ErrorNotFound
+	}
+	return errors.Is(err, sql.ErrNoRows)
+}
+
+func IsConflict(err error) bool {
+	var repoErr *Error
+	if errors.As(err, &repoErr) {
+		return repoErr.Category == ErrorConflict
+	}
+	return false
+}
+
+func IsConstraint(err error) bool {
+	var repoErr *Error
+	if errors.As(err, &repoErr) {
+		return repoErr.Category == ErrorConstraint
+	}
+	return false
+}

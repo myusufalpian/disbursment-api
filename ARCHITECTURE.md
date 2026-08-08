@@ -28,6 +28,15 @@ Role-Based Access Control (RBAC) is enforced by `RequireRole` middleware, evalua
 
 The trade-off is storing refresh session state in PostgreSQL rather than an in-memory cache like Redis. However, using PostgreSQL row-level locks for rotation avoids introducing external state infrastructure while providing single-winner transaction guarantees.
 
+## 1.4 Disbursement Mutations & Transactional Outbox
+
+The system integrates resource creation, list/detail query filtering, status finalization, soft deletion, and transactional audit outbox logging:
+
+- **Disbursement Creation & Server Fee Calculation:** `POST /disbursements` enforces server-side fee calculations (`2,500` IDR for amounts < 5,000,000 IDR; `5,000` IDR for amounts ≥ 5,000,000 IDR), initializes status to `PENDING`, binds `created_by` to the authenticated JWT identity, validates `Idempotency-Key` headers, and records a durable `audit_outbox` event in the primary transaction.
+- **Search, Filtering, & Read Projection:** `GET /disbursements` provides parameterized trigram search (`ILIKE` matching on `recipient_name` and `account_number`), status filtering, UTC half-open date range predicates (`[start, end)`), whitelisted sort ordering (`amount`, `recipient_name`, `status`, `created_at`), and active record isolation (`deleted_at IS NULL`). `GET /disbursements/:id` projects the `decided_by` actor along with legacy `approved_by` read aliases.
+- **Status Finalization & Idempotent Soft Deletion:** `PATCH /disbursements/:id/status` executes single-winner atomic status updates for `ADMIN` and `SUPERADMIN` roles. `DELETE /disbursements/:id` executes soft deletion (`deleted_at = now()`) for `SUPERADMIN` roles on `PENDING` resources, returning `204 No Content` idempotently on repeated calls without generating duplicate outbox events.
+- **Transactional Outbox Durability & Trade-off:** All business mutations (`Create`, `UpdateStatus`, `SoftDelete`) and their associated `audit_outbox` entries commit atomically within a single PostgreSQL transaction. If outbox insertion fails, the entire business mutation rolls back. The trade-off is slightly higher transaction write latency per mutation in exchange for guaranteed audit event durability (*zero audit data loss*).
+
 ## Supporting Decisions and Trade-offs
 
 | Decision | Rationale | Accepted Trade-off |

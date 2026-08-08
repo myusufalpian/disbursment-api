@@ -129,7 +129,7 @@ func TestAuthHTTPIntegration(t *testing.T) {
 
 	authHandler := httpapi.NewAuthHandler(authService, validatorEngine)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	router := httpapi.NewRouter(1<<20, logger, authHandler)
+	router := httpapi.NewRouter(1<<20, logger, "test-secret-key-12345", authHandler, nil)
 
 	var refreshToken string
 

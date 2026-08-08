@@ -18,19 +18,19 @@ type Transactor interface {
 }
 
 type User struct {
-	ID           uuid.UUID
-	Username     string
-	PasswordHash string
-	Role         string
+	ID           uuid.UUID `db:"id"`
+	Username     string    `db:"username"`
+	PasswordHash string    `db:"password_hash"`
+	Role         string    `db:"role"`
 }
 
 type RefreshSession struct {
-	ID           uuid.UUID
-	UserID       uuid.UUID
-	TokenHash    string
-	ExpiresAt    time.Time
-	RevokedAt    *time.Time
-	ReplacedByID *uuid.UUID
+	ID           uuid.UUID  `db:"id"`
+	UserID       uuid.UUID  `db:"user_id"`
+	TokenHash    string     `db:"token_hash"`
+	ExpiresAt    time.Time  `db:"expires_at"`
+	RevokedAt    *time.Time `db:"revoked_at"`
+	ReplacedByID *uuid.UUID `db:"replaced_by_id"`
 }
 
 type UserStore interface {
@@ -45,9 +45,22 @@ type RefreshSessionStore interface {
 	RevokeByTokenHash(context.Context, Transaction, string, time.Time) error
 }
 
+type DisbursementFilter struct {
+	Page      int
+	Limit     int
+	Status    domain.DisbursementStatus
+	Search    string
+	SortBy    string
+	SortOrder string
+	DateRange *domain.DateRange
+}
+
 type DisbursementStore interface {
 	FindByID(context.Context, uuid.UUID) (domain.Disbursement, error)
 	Insert(context.Context, Transaction, domain.Disbursement) error
+	List(context.Context, DisbursementFilter) ([]domain.Disbursement, int, error)
+	UpdateStatus(context.Context, Transaction, uuid.UUID, domain.Decision) (domain.Disbursement, error)
+	SoftDelete(context.Context, Transaction, uuid.UUID) (domain.Disbursement, bool, error)
 }
 
 type IdempotencyStore interface {

@@ -14,6 +14,8 @@ import (
 	"disbursment-api/internal/httpapi/validation"
 	"disbursment-api/internal/repository/postgres"
 	"disbursment-api/internal/service/auth"
+	"disbursment-api/internal/service/disbursement"
+	"disbursment-api/internal/service/idempotency"
 )
 
 type Application struct {
@@ -35,6 +37,19 @@ func New(ctx context.Context, config config.Config, logger *slog.Logger) (*Appli
 	userStore := postgres.NewUserStore(db)
 	sessionStore := postgres.NewRefreshSessionStore(db)
 	transactor := postgres.NewTransactor(db)
+	disbursementStore := postgres.NewDisbursementStore(db)
+	auditOutboxStore := postgres.NewAuditOutboxStore()
+	idempotencyStore := postgres.NewIdempotencyStore(db)
+
+	idempotencyCoordinator, err := idempotency.NewDefaultCoordinator(
+		idempotencyStore,
+		config.Idempotency.LeaseTTL,
+		config.Idempotency.ReplayTTL,
+	)
+	if err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("idempotency coordinator init failed: %w", err)
+	}
 
 	authService := auth.NewService(
 		userStore,
@@ -45,6 +60,17 @@ func New(ctx context.Context, config config.Config, logger *slog.Logger) (*Appli
 		config.Security.RefreshTokenTTL,
 	)
 
+	disbursementService, err := disbursement.NewService(
+		disbursementStore,
+		auditOutboxStore,
+		transactor,
+		idempotencyCoordinator,
+	)
+	if err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("disbursement service init failed: %w", err)
+	}
+
 	validatorEngine, err := validation.New()
 	if err != nil {
 		_ = db.Close()
@@ -52,7 +78,15 @@ func New(ctx context.Context, config config.Config, logger *slog.Logger) (*Appli
 	}
 
 	authHandler := httpapi.NewAuthHandler(authService, validatorEngine)
-	router := httpapi.NewRouter(config.HTTP.MaxRequestBodyBytes, logger, authHandler)
+	disbursementHandler := httpapi.NewDisbursementHandler(disbursementService, validatorEngine)
+
+	router := httpapi.NewRouter(
+		config.HTTP.MaxRequestBodyBytes,
+		logger,
+		config.Security.JWTSecret,
+		authHandler,
+		disbursementHandler,
+	)
 
 	return &Application{
 		database: db,
