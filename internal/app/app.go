@@ -11,6 +11,9 @@ import (
 	"disbursment-api/internal/config"
 	"disbursment-api/internal/database"
 	"disbursment-api/internal/httpapi"
+	"disbursment-api/internal/httpapi/validation"
+	"disbursment-api/internal/repository/postgres"
+	"disbursment-api/internal/service/auth"
 )
 
 type Application struct {
@@ -24,16 +27,38 @@ type databaseCloser interface {
 }
 
 func New(ctx context.Context, config config.Config, logger *slog.Logger) (*Application, error) {
-	database, err := database.Open(ctx, config.Database)
+	db, err := database.Open(ctx, config.Database)
 	if err != nil {
 		return nil, err
 	}
 
+	userStore := postgres.NewUserStore(db)
+	sessionStore := postgres.NewRefreshSessionStore(db)
+	transactor := postgres.NewTransactor(db)
+
+	authService := auth.NewService(
+		userStore,
+		sessionStore,
+		transactor,
+		config.Security.JWTSecret,
+		config.Security.AccessTokenTTL,
+		config.Security.RefreshTokenTTL,
+	)
+
+	validatorEngine, err := validation.New()
+	if err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("validator init failed: %w", err)
+	}
+
+	authHandler := httpapi.NewAuthHandler(authService, validatorEngine)
+	router := httpapi.NewRouter(config.HTTP.MaxRequestBodyBytes, logger, authHandler)
+
 	return &Application{
-		database: database,
+		database: db,
 		server: &http.Server{
 			Addr:         config.HTTP.Address,
-			Handler:      httpapi.NewRouter(config.HTTP.MaxRequestBodyBytes, logger),
+			Handler:      router,
 			ReadTimeout:  config.HTTP.ReadTimeout,
 			WriteTimeout: config.HTTP.WriteTimeout,
 			IdleTimeout:  config.HTTP.IdleTimeout,
