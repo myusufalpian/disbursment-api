@@ -85,6 +85,54 @@ func Internal() *Error {
 	}
 }
 
+func DisbursementNotFound() *Error {
+	return &Error{
+		Code:    CodeDisbursementNotFound,
+		Message: "Disbursement tidak ditemukan",
+		Status:  404,
+	}
+}
+
+func DisbursementAlreadyFinalized() *Error {
+	return &Error{
+		Code:    CodeDisbursementAlreadyFinalized,
+		Message: "Disbursement sudah difinalisasi",
+		Status:  409,
+	}
+}
+
+func DisbursementNotDeletable() *Error {
+	return &Error{
+		Code:    CodeDisbursementNotDeletable,
+		Message: "Disbursement tidak dapat dihapus karena sudah difinalisasi",
+		Status:  400,
+	}
+}
+
+func ConcurrentModification() *Error {
+	return &Error{
+		Code:    CodeConcurrentModification,
+		Message: "Terjadi konflik modifikasi simultan",
+		Status:  409,
+	}
+}
+
+func IdempotencyKeyReused() *Error {
+	return &Error{
+		Code:    CodeIdempotencyKeyReused,
+		Message: "Idempotency key telah digunakan dengan payload berbeda",
+		Status:  409,
+	}
+}
+
+func IdempotencyRequestInProgress() *Error {
+	return &Error{
+		Code:    CodeIdempotencyInProgress,
+		Message: "Request dengan idempotency key yang sama sedang diproses",
+		Status:  409,
+	}
+}
+
 func AsError(err error) *Error {
 	var domainError *Error
 	if errors.As(err, &domainError) {
@@ -92,4 +140,3 @@ func AsError(err error) *Error {
 	}
 	return Internal()
 }
-

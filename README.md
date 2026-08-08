@@ -1,8 +1,8 @@
 # Disbursement API v2
 
-A high-performance, concurrency-safe, and production-ready Disbursement REST API built with Go 1.21, Gin, PostgreSQL, and `sqlx`.
+A high-performance, concurrency-safe, and production-ready Disbursement REST API built with Go 1.25, Gin, PostgreSQL, and `sqlx`.
 
-PostgreSQL serves as the single source of truth and transactional boundary for business domain mutations, fenced idempotency claims, refresh session rotation, and durable audit outbox events.
+PostgreSQL serves as the single source of truth and transactional boundary for business domain mutations, fenced idempotency claims, refresh session rotation, and durable audit outbox events. Detailed architectural design decisions are documented in [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 ---
 
@@ -10,14 +10,15 @@ PostgreSQL serves as the single source of truth and transactional boundary for b
 
 | Category | Technology |
 |---|---|
-| **Language** | Go 1.21 |
+| **Language** | Go 1.25 (or Go 1.21+) |
 | **HTTP Framework** | Gin Web Framework (`v1.10.0`) |
 | **Database** | PostgreSQL 16 |
 | **Database Driver & Abstraction** | `lib/pq` (`v1.10.9`) & `sqlx` (`v1.4.0`) |
 | **Migration Tooling** | `golang-migrate/migrate` (`v4.17.1`) |
-| **Auth & Security** | `golang-jwt/jwt` (`v5.2.1`), `golang.org/x/crypto/bcrypt` |
+| **Auth & Security** | `golang-jwt/jwt` (`v5.2.2`), `golang.org/x/crypto/bcrypt` |
 | **Validation** | `go-playground/validator` (`v10.22.0`) |
 | **UUID Generator** | `google/uuid` (`v1.6.0`) |
+| **SQL Testing** | `DATA-DOG/go-sqlmock` (`v1.5.2`) |
 
 ---
 
@@ -46,10 +47,116 @@ Detailed architectural decision records and system design choices are documented
 - **Fenced Row Locking:** Verifies claim ownership via `SELECT ... FOR UPDATE` inside the business transaction using the owner `claim_id`.
 - **Semantic Replay:** Replays completed responses for 24 hours with `X-Idempotent-Replayed: true` header.
 
-### 4. Transactional Audit Outbox & Redaction (`internal/domain` & `internal/repository/postgres`)
-- **Transactional Consistency:** All mutations write immutable audit events into `audit_outbox` within the caller's database transaction (`Transactor.WithinTransaction`).
-- **Automatic Sensitive Redaction:** `AuditSnapshot` inspects payloads and automatically masks sensitive fields (`password`, `authorization`, `account_number`, `token`) into `[REDACTED]`.
-- **Central Sensitivity Package:** `sensitivity.IsSensitiveKey(key string)` unifies key redaction across domain audit snapshots and observability log attributes without cross-layer package coupling.
+### 4. Disbursement Workflow & Transactional Outbox (`internal/service/disbursement` & `internal/repository/postgres`)
+- **Create Disbursement Slice:** Binds server fee calculations, sets status to `PENDING`, extracts `created_by` from JWT identity, parses `Idempotency-Key` headers, and writes a durable `audit_outbox` event in a single PostgreSQL transaction (`Transactor.WithinTransaction`).
+- **List & Detail Query Slice:** `GET /disbursements` provides parameterized trigram search (`ILIKE` on `recipient_name` and `account_number`), status filtering, UTC date range filtering (`[start_date, end_date)`), whitelisted sort ordering (`amount`, `recipient_name`, `status`, `created_at`), and active row isolation (`deleted_at IS NULL`). `GET /disbursements/:id` maps `decided_by` along with legacy `approved_by` aliases.
+- **Single-Winner Atomic Finalization:** `PATCH /disbursements/:id/status` executes single-winner SQL updates (`UPDATE disbursements SET status = $1 ... WHERE id = $5 AND status = 'PENDING' AND deleted_at IS NULL`). Concurrent losing requests receive `409 DISBURSEMENT_ALREADY_FINALIZED`.
+- **Idempotent Soft Delete:** `DELETE /disbursements/:id` performs soft deletion (`deleted_at = now()`) for `SUPERADMIN` role on `PENDING` resources, returning `204 No Content` idempotently on repeat calls without duplicate outbox writes.
+- **Transactional Outbox Consistency:** All mutations write immutable audit events into `audit_outbox` within the caller's database transaction. Any outbox insert failure triggers a complete rollback of the business mutation (*zero audit data loss*).
+
+---
+
+## Database Schema
+
+The database consists of the following core PostgreSQL tables:
+
+```sql
+-- 1. Users Table
+CREATE TABLE users (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    username VARCHAR(50) NOT NULL UNIQUE,
+    password_hash VARCHAR(255) NOT NULL,
+    role VARCHAR(20) NOT NULL CHECK (role IN ('OPERATOR', 'ADMIN', 'SUPERADMIN')),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- 2. Refresh Sessions Table
+CREATE TABLE refresh_sessions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL REFERENCES users(id),
+    token_hash VARCHAR(64) NOT NULL UNIQUE,
+    expires_at TIMESTAMPTZ NOT NULL,
+    revoked_at TIMESTAMPTZ,
+    replaced_by_id UUID REFERENCES refresh_sessions(id),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- 3. Disbursements Table
+CREATE TABLE disbursements (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    recipient_name VARCHAR(150) NOT NULL,
+    account_number VARCHAR(34) NOT NULL,
+    bank_code VARCHAR(10) NOT NULL,
+    amount BIGINT NOT NULL CHECK (amount >= 10000 AND amount <= 100000000000),
+    admin_fee BIGINT NOT NULL CHECK (admin_fee IN (2500, 5000)),
+    status VARCHAR(20) NOT NULL CHECK (status IN ('PENDING', 'APPROVED', 'REJECTED')),
+    note TEXT,
+    created_by UUID NOT NULL REFERENCES users(id),
+    decided_by UUID REFERENCES users(id),
+    decision_note TEXT,
+    decided_at TIMESTAMPTZ,
+    deleted_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Indexes for performance & search
+CREATE INDEX idx_disbursements_status ON disbursements(status) WHERE deleted_at IS NULL;
+CREATE INDEX idx_disbursements_created_at ON disbursements(created_at);
+CREATE INDEX idx_disbursements_trigram_search ON disbursements USING gin (recipient_name gin_trgm_ops, account_number gin_trgm_ops);
+
+-- 4. Idempotency Keys Table
+CREATE TABLE idempotency_keys (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL REFERENCES users(id),
+    endpoint VARCHAR(255) NOT NULL,
+    idempotency_key UUID NOT NULL,
+    request_hash VARCHAR(64) NOT NULL,
+    claim_id UUID NOT NULL,
+    status VARCHAR(20) NOT NULL CHECK (status IN ('IN_PROGRESS', 'COMPLETED')),
+    response_code INT,
+    response_body JSONB,
+    lease_expires_at TIMESTAMPTZ NOT NULL,
+    expires_at TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (user_id, endpoint, idempotency_key)
+);
+
+-- 5. Audit Outbox Table
+CREATE TABLE audit_outbox (
+    event_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    entity_type VARCHAR(50) NOT NULL,
+    entity_id UUID NOT NULL,
+    action VARCHAR(50) NOT NULL,
+    actor_id UUID NOT NULL REFERENCES users(id),
+    payload JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+```
+
+---
+
+## API Endpoints Reference
+
+### Public Authentication Endpoints (`/auth`)
+
+| Method | Path | Description | Access |
+|---|---|---|---|
+| `POST` | `/auth/login` | Login with username and password | Public |
+| `POST` | `/auth/refresh` | Rotate refresh token for a new access token | Public |
+| `POST` | `/auth/logout` | Revoke refresh token | Public |
+
+### Protected Disbursement Endpoints (`/api/v1/disbursements`)
+
+| Method | Path | Description | RBAC Role Access |
+|---|---|---|---|
+| `POST` | `/api/v1/disbursements` | Create a new disbursement | `OPERATOR`, `ADMIN`, `SUPERADMIN` |
+| `GET` | `/api/v1/disbursements` | List disbursements (with search, filter, sort) | `OPERATOR`, `ADMIN`, `SUPERADMIN` |
+| `GET` | `/api/v1/disbursements/:id` | Get disbursement detail by ID | `OPERATOR`, `ADMIN`, `SUPERADMIN` |
+| `PATCH` | `/api/v1/disbursements/:id/status` | Finalize disbursement (`APPROVED`/`REJECTED`) | `ADMIN`, `SUPERADMIN` |
+| `DELETE` | `/api/v1/disbursements/:id` | Soft delete pending disbursement | `SUPERADMIN` |
 
 ---
 
@@ -123,14 +230,14 @@ Execute the deterministic unit test suite with statement coverage:
 
 ```bash
 # Run unit tests across all packages
-CGO_ENABLED=0 GOROOT=$(go env GOROOT) GOTOOLCHAIN=local go test -coverprofile=coverage.out ./...
+CGO_ENABLED=0 go test ./...
 ```
 
 ---
 
 ## Quick Testing cURL Examples
 
-### 1. User Login
+### 1. User Login (Admin)
 ```bash
 curl -i -X POST http://localhost:8080/auth/login \
   -H "Content-Type: application/json" \
@@ -140,28 +247,42 @@ curl -i -X POST http://localhost:8080/auth/login \
   }'
 ```
 
-### 2. Refresh Token Rotation
+### 2. Create Disbursement (with Idempotency Key)
 ```bash
-curl -i -X POST http://localhost:8080/auth/refresh \
+curl -i -X POST http://localhost:8080/api/v1/disbursements \
+  -H "Authorization: Bearer <ACCESS_TOKEN>" \
   -H "Content-Type: application/json" \
+  -H "Idempotency-Key: 9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d" \
   -d '{
-    "refresh_token": "<INSERT_REFRESH_TOKEN>"
+    "recipient_name": "Budi Santoso",
+    "account_number": "1234567890",
+    "bank_code": "BCA",
+    "amount": 2500000,
+    "note": "Pembayaran Vendor Q3"
   }'
 ```
 
-### 3. Accessing Authenticated Route
+### 3. List Disbursements (Search & UTC Date Filter)
 ```bash
-curl -i -X GET http://localhost:8080/api/v1/auth/me \
-  -H "Authorization: Bearer <INSERT_ACCESS_TOKEN>"
+curl -i -X GET "http://localhost:8080/api/v1/disbursements?page=1&limit=10&status=PENDING&search=Budi&sort_by=amount&sort_order=asc&start_date=2026-08-01T00:00:00Z&end_date=2026-08-31T23:59:59Z" \
+  -H "Authorization: Bearer <ACCESS_TOKEN>"
 ```
 
-### 4. User Logout
+### 4. Approve Disbursement Status
 ```bash
-curl -i -X POST http://localhost:8080/auth/logout \
+curl -i -X PATCH http://localhost:8080/api/v1/disbursements/<DISBURSEMENT_ID>/status \
+  -H "Authorization: Bearer <ADMIN_ACCESS_TOKEN>" \
   -H "Content-Type: application/json" \
   -d '{
-    "refresh_token": "<INSERT_REFRESH_TOKEN>"
+    "status": "APPROVED",
+    "note": "Disetujui sesuai invoice"
   }'
+```
+
+### 5. Soft Delete Pending Disbursement (Superadmin)
+```bash
+curl -i -X DELETE http://localhost:8080/api/v1/disbursements/<DISBURSEMENT_ID> \
+  -H "Authorization: Bearer <SUPERADMIN_ACCESS_TOKEN>"
 ```
 
 ---
@@ -174,11 +295,17 @@ curl -i -X POST http://localhost:8080/auth/logout \
 {
   "success": true,
   "data": {
-    "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6...",
-    "refresh_token": "a1b2c3d4-e5f6-7a8b-9c0d-1e2f3a4b5c6d",
-    "token_type": "Bearer",
-    "expires_in": 900,
-    "refresh_expires_in": 604800
+    "id": "550e8400-e29b-41d4-a716-446655440000",
+    "recipient_name": "Budi Santoso",
+    "account_number": "1234567890",
+    "bank_code": "BCA",
+    "amount": 2500000,
+    "admin_fee": 2500,
+    "status": "PENDING",
+    "note": "Pembayaran Vendor Q3",
+    "created_by": "110e8400-e29b-41d4-a716-446655440000",
+    "created_at": "2026-08-08T10:00:00Z",
+    "updated_at": "2026-08-08T10:00:00Z"
   }
 }
 ```
@@ -193,8 +320,8 @@ curl -i -X POST http://localhost:8080/auth/logout \
 {
   "success": false,
   "error": {
-    "code": "INVALID_CREDENTIALS",
-    "message": "Username atau password salah"
+    "code": "DISBURSEMENT_ALREADY_FINALIZED",
+    "message": "Disbursement sudah berada dalam status final dan tidak dapat diubah"
   },
   "request_id": "550e8400-e29b-41d4-a716-446655440000"
 }
@@ -232,8 +359,8 @@ Example Access Log:
   "msg": "request completed",
   "request_id": "550e8400-e29b-41d4-a716-446655440000",
   "method": "POST",
-  "path": "/auth/login",
-  "status_code": 200,
+  "path": "/api/v1/disbursements",
+  "status_code": 201,
   "latency_ms": 42
 }
 ```

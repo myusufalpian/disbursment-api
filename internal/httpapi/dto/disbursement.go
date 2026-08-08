@@ -1,5 +1,13 @@
 package dto
 
+import (
+	"time"
+
+	"disbursment-api/internal/domain"
+
+	"github.com/google/uuid"
+)
+
 type CreateDisbursementRequest struct {
 	RecipientName string `json:"recipient_name" validate:"required,maxchars=150"`
 	AccountNumber string `json:"account_number" validate:"required,numeric,min=6,max=34"`
@@ -22,4 +30,46 @@ type ListDisbursementsQuery struct {
 	SortOrder string `form:"sort_order" validate:"omitempty,oneof=asc desc"`
 	DateFrom  string `form:"date_from" validate:"omitempty,datetime=2006-01-02"`
 	DateTo    string `form:"date_to" validate:"omitempty,datetime=2006-01-02"`
+}
+
+type DisbursementResponse struct {
+	ID            uuid.UUID                 `json:"id"`
+	RecipientName string                    `json:"recipient_name"`
+	AccountNumber string                    `json:"account_number"`
+	BankCode      string                    `json:"bank_code"`
+	Amount        int64                     `json:"amount"`
+	AdminFee      int64                     `json:"admin_fee"`
+	Status        domain.DisbursementStatus `json:"status"`
+	Note          string                    `json:"note"`
+	CreatedBy     uuid.UUID                 `json:"created_by"`
+	DecidedBy     *uuid.UUID                `json:"decided_by"`
+	ApprovedBy    *uuid.UUID                `json:"approved_by"`
+	DecisionNote  string                    `json:"decision_note"`
+	DecidedAt     *time.Time                `json:"decided_at"`
+	CreatedAt     time.Time                 `json:"created_at"`
+	UpdatedAt     time.Time                 `json:"updated_at"`
+}
+
+func NewDisbursementResponse(d domain.Disbursement) DisbursementResponse {
+	var decidedBy *uuid.UUID
+	if d.DecidedBy != uuid.Nil {
+		decidedBy = &d.DecidedBy
+	}
+	return DisbursementResponse{
+		ID:            d.ID,
+		RecipientName: d.RecipientName,
+		AccountNumber: d.AccountNumber,
+		BankCode:      d.BankCode,
+		Amount:        d.Amount,
+		AdminFee:      d.AdminFee,
+		Status:        d.Status,
+		Note:          d.Note,
+		CreatedBy:     d.CreatedBy,
+		DecidedBy:     decidedBy,
+		ApprovedBy:    decidedBy,
+		DecisionNote:  d.DecisionNote,
+		DecidedAt:     d.DecidedAt,
+		CreatedAt:     d.CreatedAt,
+		UpdatedAt:     d.UpdatedAt,
+	}
 }
