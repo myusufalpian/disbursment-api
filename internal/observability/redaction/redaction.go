@@ -2,13 +2,14 @@ package redaction
 
 import (
 	"log/slog"
-	"strings"
+
+	"disbursment-api/internal/sensitivity"
 )
 
 const redactedValue = "[REDACTED]"
 
 func Attribute(attribute slog.Attr) slog.Attr {
-	if sensitive(attribute.Key) {
+	if sensitivity.IsSensitiveKey(attribute.Key) {
 		return slog.String(attribute.Key, redactedValue)
 	}
 	return attribute
@@ -27,12 +28,4 @@ func SensitiveValue(value string) string {
 		return ""
 	}
 	return redactedValue
-}
-
-func sensitive(key string) bool {
-	normalized := strings.ToLower(strings.TrimSpace(key))
-	return strings.Contains(normalized, "password") ||
-		strings.Contains(normalized, "authorization") ||
-		strings.Contains(normalized, "account_number") ||
-		strings.Contains(normalized, "token")
 }
