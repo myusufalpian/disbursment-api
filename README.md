@@ -2,7 +2,7 @@
 
 A high-performance, concurrency-safe, and production-ready Disbursement REST API built with Go 1.21, Gin, PostgreSQL, and `sqlx`.
 
-PostgreSQL serves as the single source of truth and transactional boundary for business domain mutations, fenced idempotency, and durable audit outbox events.
+PostgreSQL serves as the single source of truth and transactional boundary for business domain mutations, fenced idempotency claims, and durable audit outbox events.
 
 ---
 
@@ -21,30 +21,35 @@ PostgreSQL serves as the single source of truth and transactional boundary for b
 
 ---
 
-## Key Architecture & Design Highlights
+## Architecture & System Design
 
-Detailed architectural decisions are documented in [`ARCHITECTURE.md`](ARCHITECTURE.md). Key design highlights include:
+Detailed architectural decision records and system design choices are documented in [`ARCHITECTURE.md`](ARCHITECTURE.md). Key implementation highlights include:
 
-### 1. Fenced Idempotency (`POST /disbursements`)
-- Uses PostgreSQL `idempotency_keys` table scoped by `(user_id, endpoint, key)`.
-- Enforces atomic claims via random `claim_id` UUIDs, lease expiration, and 24-hour semantic JSON replay with `X-Idempotent-Replayed: true`.
-- Prevents stale owner commits and duplicate creation during concurrent retries using database row locks (`SELECT ... FOR UPDATE`) and owner `claim_id` verification inside the business transaction.
+### 1. Domain Business Rules & Calculations (`internal/domain`)
+- **Tiered Admin Fee Calculation:** Automatically computes `2,500` IDR for disbursement amounts `< 5,000,000` IDR and `5,000` IDR for amounts `>= 5,000,000` IDR.
+- **Strict Currency & Input Bounds:** Enforces amount range between `10,000` IDR and `100,000,000,000` IDR. Validates recipient names (max 150 Unicode runes), bank account numbers (6–34 digits), bank codes (3–10 alphanumeric uppercase), and notes (max 500 Unicode runes).
+- **State Transition Boundaries:** Enforces state transition rules (`PENDING` can transition to `APPROVED` or `REJECTED`; final states cannot be altered).
+- **Soft Delete Rules:** Restricts soft deletion (`CanDelete`) strictly to `PENDING` disbursements that have not already been deleted (`deleted_at IS NULL`).
+- **UTC Date Range & Pagination:** `NewUTCDateRange` constructs exact half-open UTC date intervals `[date_from 00:00:00 UTC, date_to + 1 day 00:00:00 UTC)`. `NewPagination` computes total pages and offsets.
 
-### 2. Concurrency-Safe Finalization & Status Transitions
-- Approval and rejection use single-statement SQL conditional updates:
-  ```sql
-  UPDATE disbursements
-  SET status = $2, decided_by = $3, decision_note = $4, decided_at = now(), updated_at = now()
-  WHERE id = $1 AND status = 'PENDING' AND deleted_at IS NULL
-  RETURNING *;
-  ```
-- Evaluates status preconditions atomically at the database engine level under `READ COMMITTED` isolation, eliminating lost updates without the overhead or complexity of distributed locks or application-side read-then-write locks.
-- Returns `409 CONCURRENT_MODIFICATION` for concurrent modification races and `404 DISBURSEMENT_NOT_FOUND` if the resource does not exist or is soft-deleted.
+### 2. Fenced Idempotency Coordinator (`internal/service/idempotency` & `internal/repository/postgres`)
+- **SHA-256 Canonical Fingerprinting:** Computes a canonical SHA-256 digest over the HTTP method, endpoint, and canonicalized JSON payload.
+- **Timing Attack Resistance:** Uses `crypto/subtle.ConstantTimeCompare` for fingerprint verification, preventing side-channel timing analysis.
+- **Atomic Claim Acquisition & Reclaim:** Executes `INSERT INTO idempotency_keys ... ON CONFLICT DO NOTHING`. Reclaims stale active claims (lease expired) or expired keys (24h past) atomically with a new random `claim_id` UUID.
+- **Fenced Row Locking:** Verifies claim ownership via `SELECT ... FOR UPDATE` inside the business transaction using the owner `claim_id`.
+- **Semantic Replay:** Replays completed responses for 24 hours with `X-Idempotent-Replayed: true` header.
 
-### 3. Transactional Audit Outbox & Non-Repudiation
-- All mutations (`create`, `finalize`, `soft-delete`) write immutable audit events into `audit_outbox` within the exact same database transaction as the domain state change.
-- A Pl/pgSQL trigger `prevent_audit_outbox_event_id_change()` enforces strict immutability on `audit_outbox.event_id`.
-- `audit_logs.source_event_id` enforces unique projection constraint to guarantee idempotent event delivery.
+### 3. Transactional Audit Outbox & Redaction (`internal/domain` & `internal/repository/postgres`)
+- **Transactional Consistency:** All mutations write immutable audit events into `audit_outbox` within the caller's database transaction (`Transactor.WithinTransaction`).
+- **Automatic PII Redaction:** `AuditSnapshot` inspects payloads and automatically masks sensitive fields (`password`, `authorization`, `account_number`, `token`) into `[REDACTED]`.
+- **Database Immutability:** Pl/pgSQL trigger `prevent_audit_outbox_event_id_change()` prevents any modification to `audit_outbox.event_id`.
+
+### 4. Central Sensitivity Package (`internal/sensitivity`)
+- Exports `IsSensitiveKey(key string) bool` to unify key redaction across domain audit snapshots and observability log attributes without cross-layer package coupling.
+
+### 5. Repository Abstraction & Error Classification (`internal/repository`)
+- **Transaction Scoping:** `Transactor.WithinTransaction` provides safe transaction scoping and automatic rollback on error.
+- **Error Classification:** `Classify(err)` translates raw database errors into unified categories (`ErrorNotFound`, `ErrorConflict`, `ErrorConstraint`, `ErrorDependency`).
 
 ---
 
@@ -60,7 +65,7 @@ Detailed architectural decisions are documented in [`ARCHITECTURE.md`](ARCHITECT
 │   ├── config/          # Environment configuration parser with fail-fast validation
 │   ├── database/        # PostgreSQL connection pool setup and context ping
 │   ├── dependencies/    # Dependency tracking package
-│   ├── domain/          # Core domain models and standardized error types
+│   ├── domain/          # Core domain models, fee rules, validation, and audit events
 │   ├── httpapi/
 │   │   ├── binding/     # Strict JSON body decoder (disallows unknown fields)
 │   │   ├── dto/         # Request DTOs and query parameters
@@ -69,11 +74,18 @@ Detailed architectural decisions are documented in [`ARCHITECTURE.md`](ARCHITECT
 │   │   ├── validation/  # Custom validator with Unicode rune count checks
 │   │   └── router.go    # Gin engine setup and NoRoute fallback
 │   ├── migration/       # Wrapper for golang-migrate and SQL seed execution
-│   └── observability/
-│       └── redaction/   # Automatic log redaction for sensitive fields
+│   ├── observability/
+│   │   └── redaction/   # Log attribute redaction for sensitive fields
+│   ├── repository/
+│   │   ├── postgres/    # PostgreSQL transaction, idempotency, and outbox stores
+│   │   ├── contracts.go # Service-facing repository interfaces
+│   │   └── errors.go    # Repository error classification
+│   ├── sensitivity/     # Centralized sensitive key detection utility
+│   └── service/
+│       └── idempotency/ # Fenced idempotency coordinator and SHA-256 fingerprinting
 ├── migrations/          # Raw SQL schema migration files and idempotent seed
-├── ARCHITECTURE.md      # Standalone architectural decision document
-└── README.md            # Project documentation handbook
+├── ARCHITECTURE.md      # Architectural design and system decisions document
+└── README.md            # Main developer handbook
 ```
 
 ---
@@ -144,18 +156,18 @@ go run ./cmd/api
 
 ### 4. Running the Test Suite
 
-Execute the deterministic unit test suite:
+Execute the deterministic unit test suite with statement coverage:
 
 ```bash
 # Run unit tests across all packages
-CGO_ENABLED=0 GOROOT=$(go env GOROOT) go test -v ./...
+CGO_ENABLED=0 GOROOT=$(go env GOROOT) go test -v -cover ./...
 ```
 
 ---
 
 ## API Envelopes & Contract Specification
 
-### 1. Success Response (`HTTP 200 / 201`)
+### 1. Success Response Envelope (`HTTP 200 / 201`)
 
 ```json
 {
@@ -180,7 +192,7 @@ CGO_ENABLED=0 GOROOT=$(go env GOROOT) go test -v ./...
 - Body: **Empty (0 bytes)**
 - Headers: `X-Request-ID` is preserved.
 
-### 3. Error Response (`HTTP 400 / 401 / 403 / 404 / 409 / 500`)
+### 3. Error Response Envelope (`HTTP 400 / 401 / 403 / 404 / 409 / 500`)
 
 ```json
 {
@@ -201,7 +213,7 @@ CGO_ENABLED=0 GOROOT=$(go env GOROOT) go test -v ./...
 
 ### 4. Standard Domain Error Codes
 
-| Error Code | HTTP Status | Meaning |
+| Error Code | HTTP Status | Trigger Condition |
 |---|---|---|
 | `VALIDATION_ERROR` | `400` | Malformed JSON, unknown fields, or struct validation failed |
 | `INVALID_IDEMPOTENCY_KEY` | `400` | Missing or non-UUID v4 `Idempotency-Key` header |
