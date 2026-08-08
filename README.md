@@ -2,7 +2,7 @@
 
 A high-performance, concurrency-safe, and production-ready Disbursement REST API built with Go 1.21, Gin, PostgreSQL, and `sqlx`.
 
-PostgreSQL serves as the single source of truth and transactional boundary for business domain mutations, fenced idempotency claims, and durable audit outbox events.
+PostgreSQL serves as the single source of truth and transactional boundary for business domain mutations, fenced idempotency claims, refresh session rotation, and durable audit outbox events.
 
 ---
 
@@ -25,68 +25,31 @@ PostgreSQL serves as the single source of truth and transactional boundary for b
 
 Detailed architectural decision records and system design choices are documented in [`ARCHITECTURE.md`](ARCHITECTURE.md). Key implementation highlights include:
 
-### 1. Domain Business Rules & Calculations (`internal/domain`)
+### 1. Identity, Access & Session Management (`internal/service/auth` & `internal/httpapi/middleware`)
+- **Stateless Bearer JWT Authentication:** Issues access JWTs signed with HMAC-SHA256 (`JWT_SECRET`) carrying `sub`, `username`, `role`, `iat`, and `exp` (15m TTL). Middleware explicitly verifies HMAC signing (`*jwt.SigningMethodHMAC`) to prevent `none` algorithm & key-confusion attacks.
+- **PostgreSQL-Backed Refresh Rotation:** Cryptographic UUID v4 refresh tokens are stored solely as SHA-256 hashes (`token_hash`). Plaintext tokens are never persisted or logged. `POST /auth/refresh` executes atomic session rotation (`revoked_at = now()`, `replaced_by_id = new_session.id`) and new session insertion in a single PostgreSQL transaction.
+- **Single-Winner Race Protection:** PostgreSQL row-level locks and `UPDATE ... WHERE token_hash = $1 AND revoked_at IS NULL AND expires_at > $1` ensure N concurrent refresh requests produce exactly one winner (`RowsAffected == 1`). All concurrent losers or reused tokens receive `401 INVALID_REFRESH_TOKEN`.
+- **Idempotent Logout:** `POST /auth/logout` atomically revokes refresh sessions. Repeated logouts return `204 No Content` without error.
+- **Role-Based Access Control (RBAC):** `RequireRole` middleware enforces role boundaries (`OPERATOR`, `ADMIN`, `SUPERADMIN`), returning `403 FORBIDDEN` when permissions are insufficient.
+
+### 2. Domain Business Rules & Calculations (`internal/domain`)
 - **Tiered Admin Fee Calculation:** Automatically computes `2,500` IDR for disbursement amounts `< 5,000,000` IDR and `5,000` IDR for amounts `>= 5,000,000` IDR.
 - **Strict Currency & Input Bounds:** Enforces amount range between `10,000` IDR and `100,000,000,000` IDR. Validates recipient names (max 150 Unicode runes), bank account numbers (6–34 digits), bank codes (3–10 alphanumeric uppercase), and notes (max 500 Unicode runes).
 - **State Transition Boundaries:** Enforces state transition rules (`PENDING` can transition to `APPROVED` or `REJECTED`; final states cannot be altered).
 - **Soft Delete Rules:** Restricts soft deletion (`CanDelete`) strictly to `PENDING` disbursements that have not already been deleted (`deleted_at IS NULL`).
 - **UTC Date Range & Pagination:** `NewUTCDateRange` constructs exact half-open UTC date intervals `[date_from 00:00:00 UTC, date_to + 1 day 00:00:00 UTC)`. `NewPagination` computes total pages and offsets.
 
-### 2. Fenced Idempotency Coordinator (`internal/service/idempotency` & `internal/repository/postgres`)
+### 3. Fenced Idempotency Coordinator (`internal/service/idempotency` & `internal/repository/postgres`)
 - **SHA-256 Canonical Fingerprinting:** Computes a canonical SHA-256 digest over the HTTP method, endpoint, and canonicalized JSON payload.
 - **Timing Attack Resistance:** Uses `crypto/subtle.ConstantTimeCompare` for fingerprint verification, preventing side-channel timing analysis.
 - **Atomic Claim Acquisition & Reclaim:** Executes `INSERT INTO idempotency_keys ... ON CONFLICT DO NOTHING`. Reclaims stale active claims (lease expired) or expired keys (24h past) atomically with a new random `claim_id` UUID.
 - **Fenced Row Locking:** Verifies claim ownership via `SELECT ... FOR UPDATE` inside the business transaction using the owner `claim_id`.
 - **Semantic Replay:** Replays completed responses for 24 hours with `X-Idempotent-Replayed: true` header.
 
-### 3. Transactional Audit Outbox & Redaction (`internal/domain` & `internal/repository/postgres`)
+### 4. Transactional Audit Outbox & Redaction (`internal/domain` & `internal/repository/postgres`)
 - **Transactional Consistency:** All mutations write immutable audit events into `audit_outbox` within the caller's database transaction (`Transactor.WithinTransaction`).
-- **Automatic PII Redaction:** `AuditSnapshot` inspects payloads and automatically masks sensitive fields (`password`, `authorization`, `account_number`, `token`) into `[REDACTED]`.
-- **Database Immutability:** Pl/pgSQL trigger `prevent_audit_outbox_event_id_change()` prevents any modification to `audit_outbox.event_id`.
-
-### 4. Central Sensitivity Package (`internal/sensitivity`)
-- Exports `IsSensitiveKey(key string) bool` to unify key redaction across domain audit snapshots and observability log attributes without cross-layer package coupling.
-
-### 5. Repository Abstraction & Error Classification (`internal/repository`)
-- **Transaction Scoping:** `Transactor.WithinTransaction` provides safe transaction scoping and automatic rollback on error.
-- **Error Classification:** `Classify(err)` translates raw database errors into unified categories (`ErrorNotFound`, `ErrorConflict`, `ErrorConstraint`, `ErrorDependency`).
-
----
-
-## Directory Structure
-
-```
-.
-├── cmd/
-│   ├── api/             # Main HTTP API application entrypoint
-│   └── migrate/         # Database migration and seed CLI tool
-├── internal/
-│   ├── app/             # Application wiring, server lifecycle, and graceful shutdown
-│   ├── config/          # Environment configuration parser with fail-fast validation
-│   ├── database/        # PostgreSQL connection pool setup and context ping
-│   ├── dependencies/    # Dependency tracking package
-│   ├── domain/          # Core domain models, fee rules, validation, and audit events
-│   ├── httpapi/
-│   │   ├── binding/     # Strict JSON body decoder (disallows unknown fields)
-│   │   ├── dto/         # Request DTOs and query parameters
-│   │   ├── middleware/  # RequestID, Recovery, AccessLog, and BodyLimit middleware
-│   │   ├── response/    # Standardized JSON success and error response envelopes
-│   │   ├── validation/  # Custom validator with Unicode rune count checks
-│   │   └── router.go    # Gin engine setup and NoRoute fallback
-│   ├── migration/       # Wrapper for golang-migrate and SQL seed execution
-│   ├── observability/
-│   │   └── redaction/   # Log attribute redaction for sensitive fields
-│   ├── repository/
-│   │   ├── postgres/    # PostgreSQL transaction, idempotency, and outbox stores
-│   │   ├── contracts.go # Service-facing repository interfaces
-│   │   └── errors.go    # Repository error classification
-│   ├── sensitivity/     # Centralized sensitive key detection utility
-│   └── service/
-│       └── idempotency/ # Fenced idempotency coordinator and SHA-256 fingerprinting
-├── migrations/          # Raw SQL schema migration files and idempotent seed
-├── ARCHITECTURE.md      # Architectural design and system decisions document
-└── README.md            # Main developer handbook
-```
+- **Automatic Sensitive Redaction:** `AuditSnapshot` inspects payloads and automatically masks sensitive fields (`password`, `authorization`, `account_number`, `token`) into `[REDACTED]`.
+- **Central Sensitivity Package:** `sensitivity.IsSensitiveKey(key string)` unifies key redaction across domain audit snapshots and observability log attributes without cross-layer package coupling.
 
 ---
 
@@ -94,13 +57,13 @@ Detailed architectural decision records and system design choices are documented
 
 ### Prerequisites
 - Go `1.21` or newer
-- PostgreSQL `16` or newer running locally or via Docker
+- PostgreSQL `16` or newer
 
 ---
 
 ### 1. Environment Configuration
 
-Copy or set mandatory environment variables:
+Set mandatory environment variables:
 
 ```bash
 export DATABASE_URL="postgres://postgres:postgres@localhost:5432/disbursement_db?sslmode=disable"
@@ -132,7 +95,7 @@ export HTTP_ADDRESS=":8080"
 
 ### 2. Database Migration & Seeding
 
-Run all `UP` migrations and seed local test accounts (`local_test_operator`, `local_test_admin`, `local_test_superadmin`):
+Run all schema migrations and seed local test accounts (`testoperator`, `testadmin`, `testsuperadmin`):
 
 ```bash
 # Apply schema migrations and idempotent local seed
@@ -160,7 +123,45 @@ Execute the deterministic unit test suite with statement coverage:
 
 ```bash
 # Run unit tests across all packages
-CGO_ENABLED=0 GOROOT=$(go env GOROOT) go test -v -cover ./...
+CGO_ENABLED=0 GOROOT=$(go env GOROOT) GOTOOLCHAIN=local go test -coverprofile=coverage.out ./...
+```
+
+---
+
+## Quick Testing cURL Examples
+
+### 1. User Login
+```bash
+curl -i -X POST http://localhost:8080/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{
+    "username": "testadmin",
+    "password": "Password123!"
+  }'
+```
+
+### 2. Refresh Token Rotation
+```bash
+curl -i -X POST http://localhost:8080/auth/refresh \
+  -H "Content-Type: application/json" \
+  -d '{
+    "refresh_token": "<INSERT_REFRESH_TOKEN>"
+  }'
+```
+
+### 3. Accessing Authenticated Route
+```bash
+curl -i -X GET http://localhost:8080/api/v1/auth/me \
+  -H "Authorization: Bearer <INSERT_ACCESS_TOKEN>"
+```
+
+### 4. User Logout
+```bash
+curl -i -X POST http://localhost:8080/auth/logout \
+  -H "Content-Type: application/json" \
+  -d '{
+    "refresh_token": "<INSERT_REFRESH_TOKEN>"
+  }'
 ```
 
 ---
@@ -173,17 +174,11 @@ CGO_ENABLED=0 GOROOT=$(go env GOROOT) go test -v -cover ./...
 {
   "success": true,
   "data": {
-    "id": "550e8400-e29b-41d4-a716-446655440000",
-    "recipient_name": "Budi Santoso",
-    "amount": 1250000,
-    "admin_fee": 2500,
-    "status": "PENDING"
-  },
-  "meta": {
-    "page": 1,
-    "limit": 20,
-    "total": 1,
-    "total_pages": 1
+    "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6...",
+    "refresh_token": "a1b2c3d4-e5f6-7a8b-9c0d-1e2f3a4b5c6d",
+    "token_type": "Bearer",
+    "expires_in": 900,
+    "refresh_expires_in": 604800
   }
 }
 ```
@@ -198,14 +193,8 @@ CGO_ENABLED=0 GOROOT=$(go env GOROOT) go test -v -cover ./...
 {
   "success": false,
   "error": {
-    "code": "VALIDATION_ERROR",
-    "message": "Input tidak valid",
-    "details": [
-      {
-        "field": "recipient_name",
-        "message": "panjang maksimum 150"
-      }
-    ]
+    "code": "INVALID_CREDENTIALS",
+    "message": "Username atau password salah"
   },
   "request_id": "550e8400-e29b-41d4-a716-446655440000"
 }
@@ -243,8 +232,8 @@ Example Access Log:
   "msg": "request completed",
   "request_id": "550e8400-e29b-41d4-a716-446655440000",
   "method": "POST",
-  "path": "/disbursements",
-  "status_code": 201,
-  "latency_ms": 14
+  "path": "/auth/login",
+  "status_code": 200,
+  "latency_ms": 42
 }
 ```

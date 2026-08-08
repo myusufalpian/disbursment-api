@@ -25,20 +25,24 @@ type User struct {
 }
 
 type RefreshSession struct {
-	ID        uuid.UUID
-	UserID    uuid.UUID
-	TokenHash string
-	ExpiresAt time.Time
-	RevokedAt *time.Time
+	ID           uuid.UUID
+	UserID       uuid.UUID
+	TokenHash    string
+	ExpiresAt    time.Time
+	RevokedAt    *time.Time
+	ReplacedByID *uuid.UUID
 }
 
 type UserStore interface {
 	FindByID(context.Context, uuid.UUID) (User, error)
+	FindByUsername(context.Context, string) (User, error)
 }
 
 type RefreshSessionStore interface {
-	FindByTokenHash(context.Context, string) (RefreshSession, error)
-	Revoke(context.Context, Transaction, uuid.UUID, time.Time) error
+	Create(context.Context, Transaction, RefreshSession) error
+	FindByTokenHash(context.Context, Transaction, string) (RefreshSession, error)
+	Rotate(context.Context, Transaction, string, RefreshSession, time.Time) error
+	RevokeByTokenHash(context.Context, Transaction, string, time.Time) error
 }
 
 type DisbursementStore interface {

@@ -45,6 +45,38 @@ func Validation(details []FieldError) *Error {
 	}
 }
 
+func InvalidCredentials() *Error {
+	return &Error{
+		Code:    CodeInvalidCredentials,
+		Message: "Kredensial tidak valid",
+		Status:  401,
+	}
+}
+
+func Unauthorized() *Error {
+	return &Error{
+		Code:    CodeUnauthorized,
+		Message: "Autentikasi diperlukan",
+		Status:  401,
+	}
+}
+
+func InvalidRefreshToken() *Error {
+	return &Error{
+		Code:    CodeInvalidRefreshToken,
+		Message: "Refresh token tidak valid",
+		Status:  401,
+	}
+}
+
+func Forbidden() *Error {
+	return &Error{
+		Code:    CodeForbidden,
+		Message: "Akses ditolak",
+		Status:  403,
+	}
+}
+
 func Internal() *Error {
 	return &Error{
 		Code:    CodeInternalError,
@@ -60,3 +92,4 @@ func AsError(err error) *Error {
 	}
 	return Internal()
 }
+
