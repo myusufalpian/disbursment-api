@@ -251,4 +251,107 @@ func TestDisbursementStore_UpdateStatusAndSoftDelete(t *testing.T) {
 			t.Errorf("expected wasDeleted = false on first delete")
 		}
 	})
+
+	t.Run("UpdateStatus error handling when no rows updated", func(t *testing.T) {
+		// 1. ErrNoRows on UPDATE status -> Check query returns record that is already APPROVED
+		mock.ExpectBegin()
+		mock.ExpectQuery("^UPDATE disbursements SET status = \\$1").
+			WillReturnError(sql.ErrNoRows)
+
+		checkRows := sqlmock.NewRows([]string{
+			"id", "recipient_name", "account_number", "bank_code", "amount", "admin_fee",
+			"status", "note", "created_by", "decided_by", "decision_note", "decided_at",
+			"deleted_at", "created_at", "updated_at",
+		}).AddRow(
+			targetID, "Jane Doe", "1234567890", "BCA", 100000, 2500,
+			"APPROVED", "Note", actorID, actorID, "Already approved", &now,
+			nil, now, now,
+		)
+
+		mock.ExpectQuery("^SELECT id, recipient_name").
+			WithArgs(targetID).
+			WillReturnRows(checkRows)
+
+		tx, _ := sqlxDB.BeginTxx(context.Background(), nil)
+		decision := domain.Decision{Status: domain.StatusApproved, ActorID: actorID}
+		_, err := store.UpdateStatus(context.Background(), newTestTx(tx), targetID, decision)
+		if err == nil {
+			t.Fatalf("expected conflict error for already approved disbursement")
+		}
+	})
+
+	t.Run("SoftDelete error handling when already deleted", func(t *testing.T) {
+		// 1. ErrNoRows on DELETE -> Check query returns record with deleted_at set
+		mock.ExpectBegin()
+		mock.ExpectQuery("^UPDATE disbursements SET deleted_at = \\$1").
+			WillReturnError(sql.ErrNoRows)
+
+		checkRows := sqlmock.NewRows([]string{
+			"id", "recipient_name", "account_number", "bank_code", "amount", "admin_fee",
+			"status", "note", "created_by", "decided_by", "decision_note", "decided_at",
+			"deleted_at", "created_at", "updated_at",
+		}).AddRow(
+			targetID, "Jane Doe", "1234567890", "BCA", 100000, 2500,
+			"PENDING", "Note", actorID, nil, nil, nil,
+			&now, now, now,
+		)
+
+		mock.ExpectQuery("^SELECT id, recipient_name").
+			WithArgs(targetID).
+			WillReturnRows(checkRows)
+
+		tx, _ := sqlxDB.BeginTxx(context.Background(), nil)
+		res, wasDeleted, err := store.SoftDelete(context.Background(), newTestTx(tx), targetID)
+		if err != nil {
+			t.Fatalf("expected nil error when already deleted, got %v", err)
+		}
+		if !wasDeleted {
+			t.Fatalf("expected wasDeleted = true")
+		}
+		if res.ID != targetID {
+			t.Fatalf("unexpected res ID: %v", res.ID)
+		}
+	})
+
+	t.Run("SoftDelete error handling when not found or finalized", func(t *testing.T) {
+		// 1. ErrNoRows on DELETE -> Check query returns ErrNoRows -> 404 NOT_FOUND
+		mock.ExpectBegin()
+		mock.ExpectQuery("^UPDATE disbursements SET deleted_at = \\$1").
+			WillReturnError(sql.ErrNoRows)
+
+		mock.ExpectQuery("^SELECT id, recipient_name").
+			WithArgs(targetID).
+			WillReturnError(sql.ErrNoRows)
+
+		tx, _ := sqlxDB.BeginTxx(context.Background(), nil)
+		_, _, err := store.SoftDelete(context.Background(), newTestTx(tx), targetID)
+		if err == nil || !repository.IsNotFound(err) {
+			t.Fatalf("expected IsNotFound error, got %v", err)
+		}
+
+		// 2. ErrNoRows on DELETE -> Check query returns APPROVED record -> 409 CONFLICT
+		mock.ExpectBegin()
+		mock.ExpectQuery("^UPDATE disbursements SET deleted_at = \\$1").
+			WillReturnError(sql.ErrNoRows)
+
+		checkRows := sqlmock.NewRows([]string{
+			"id", "recipient_name", "account_number", "bank_code", "amount", "admin_fee",
+			"status", "note", "created_by", "decided_by", "decision_note", "decided_at",
+			"deleted_at", "created_at", "updated_at",
+		}).AddRow(
+			targetID, "Jane Doe", "1234567890", "BCA", 100000, 2500,
+			"APPROVED", "Note", actorID, actorID, "Note", &now,
+			nil, now, now,
+		)
+
+		mock.ExpectQuery("^SELECT id, recipient_name").
+			WithArgs(targetID).
+			WillReturnRows(checkRows)
+
+		tx2, _ := sqlxDB.BeginTxx(context.Background(), nil)
+		_, _, err2 := store.SoftDelete(context.Background(), newTestTx(tx2), targetID)
+		if err2 == nil || !repository.IsConstraint(err2) {
+			t.Fatalf("expected IsConstraint error for approved record, got %v", err2)
+		}
+	})
 }

@@ -35,3 +35,12 @@ func TestAttributesPreservesNonSensitiveObservabilityFields(t *testing.T) {
 		}
 	}
 }
+
+func TestSensitiveValue(t *testing.T) {
+	if got := SensitiveValue(""); got != "" {
+		t.Fatalf("expected empty string for empty input, got %q", got)
+	}
+	if got := SensitiveValue("secret-data"); got != "[REDACTED]" {
+		t.Fatalf("expected [REDACTED], got %q", got)
+	}
+}

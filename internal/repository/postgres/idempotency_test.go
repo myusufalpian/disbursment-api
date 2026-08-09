@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"testing"
 	"time"
 
@@ -101,6 +102,100 @@ func TestIdempotencyStore_AcquireAndComplete(t *testing.T) {
 		err := store.Release(context.Background(), scope, claimID)
 		if err != nil {
 			t.Fatalf("Release failed: %v", err)
+		}
+	})
+
+	t.Run("Acquire existing claim fallback scenarios", func(t *testing.T) {
+		req := domain.IdempotencyClaimRequest{
+			Scope:       domain.IdempotencyScope{UserID: userID, Endpoint: endpoint, Key: key},
+			Fingerprint: fingerprint,
+			ClaimID:     claimID,
+			LeaseUntil:  leaseUntil,
+			ExpiresAt:   expiresAt,
+			Now:         now,
+		}
+
+		// 1. Existing COMPLETED claim with matching fingerprint -> Replayed
+		mock.ExpectQuery("^INSERT INTO idempotency_keys").
+			WillReturnError(sql.ErrNoRows)
+
+		mock.ExpectBegin()
+		disbursementID := uuid.New()
+		existingRows := sqlmock.NewRows([]string{
+			"request_hash", "state", "claim_id", "lease_until", "expires_at", "disbursement_id", "response_status", "response_body",
+		}).AddRow(
+			fingerprint[:], "COMPLETED", claimID, leaseUntil, expiresAt, disbursementID, 201, []byte(`{"status":"PENDING"}`),
+		)
+
+		mock.ExpectQuery("^SELECT request_hash, state, claim_id").
+			WithArgs(userID, endpoint, key).
+			WillReturnRows(existingRows)
+		mock.ExpectCommit()
+
+		res, err := store.Acquire(context.Background(), req)
+		if err != nil {
+			t.Fatalf("Acquire existing failed: %v", err)
+		}
+		if res.Outcome != domain.ClaimReplayed {
+			t.Errorf("expected ClaimReplayed, got %s", res.Outcome)
+		}
+		if res.Replay == nil || res.Replay.StatusCode != 201 {
+			t.Errorf("expected 201 status code in replayed response, got %+v", res.Replay)
+		}
+
+		// 2. Existing IN_PROGRESS claim with expired lease -> Reclaimed
+		mock.ExpectQuery("^INSERT INTO idempotency_keys").
+			WillReturnError(sql.ErrNoRows)
+
+		mock.ExpectBegin()
+		pastLease := now.Add(-10 * time.Second)
+		expiredLeaseRows := sqlmock.NewRows([]string{
+			"request_hash", "state", "claim_id", "lease_until", "expires_at", "disbursement_id", "response_status", "response_body",
+		}).AddRow(
+			fingerprint[:], "IN_PROGRESS", uuid.New(), pastLease, expiresAt, nil, nil, nil,
+		)
+
+		mock.ExpectQuery("^SELECT request_hash, state, claim_id").
+			WithArgs(userID, endpoint, key).
+			WillReturnRows(expiredLeaseRows)
+
+		mock.ExpectExec("^UPDATE idempotency_keys SET request_hash = \\$1").
+			WithArgs(fingerprint[:], claimID, leaseUntil, expiresAt, userID, endpoint, key, now).
+			WillReturnResult(sqlmock.NewResult(1, 1))
+		mock.ExpectCommit()
+
+		res2, err := store.Acquire(context.Background(), req)
+		if err != nil {
+			t.Logf("subtest 2 err = %v", err)
+			t.Fatalf("Acquire expired lease failed: %v", err)
+		}
+		if res2.Outcome != domain.ClaimAcquired {
+			t.Errorf("expected ClaimAcquired after lease reclaim, got %s", res2.Outcome)
+		}
+
+		// 3. Existing claim with fingerprint mismatch -> Reused
+		mock.ExpectQuery("^INSERT INTO idempotency_keys").
+			WillReturnError(sql.ErrNoRows)
+
+		mock.ExpectBegin()
+		diffFingerprint := sha256.Sum256([]byte("different payload"))
+		mismatchRows := sqlmock.NewRows([]string{
+			"request_hash", "state", "claim_id", "lease_until", "expires_at", "disbursement_id", "response_status", "response_body",
+		}).AddRow(
+			diffFingerprint[:], "IN_PROGRESS", uuid.New(), leaseUntil, expiresAt, nil, nil, nil,
+		)
+
+		mock.ExpectQuery("^SELECT request_hash, state, claim_id").
+			WithArgs(userID, endpoint, key).
+			WillReturnRows(mismatchRows)
+		mock.ExpectCommit()
+
+		res3, err := store.Acquire(context.Background(), req)
+		if err != nil {
+			t.Fatalf("Acquire mismatch failed: %v", err)
+		}
+		if res3.Outcome != domain.ClaimReused {
+			t.Errorf("expected ClaimReused, got %s", res3.Outcome)
 		}
 	})
 }

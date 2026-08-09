@@ -1,6 +1,6 @@
 # Disbursement API v2
 
-A high-performance, concurrency-safe, and production-ready Disbursement REST API built with Go 1.25, Gin, PostgreSQL, and `sqlx`.
+A high-performance, concurrency-safe, and production-ready Disbursement REST API built with Go 1.21, Gin, PostgreSQL, and `sqlx`.
 
 PostgreSQL serves as the single source of truth and transactional boundary for business domain mutations, fenced idempotency claims, refresh session rotation, and durable audit outbox events. Detailed architectural design decisions are documented in [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
@@ -10,15 +10,18 @@ PostgreSQL serves as the single source of truth and transactional boundary for b
 
 | Category | Technology |
 |---|---|
-| **Language** | Go 1.25 (or Go 1.21+) |
+| **Language** | Go 1.21 |
 | **HTTP Framework** | Gin Web Framework (`v1.10.0`) |
-| **Database** | PostgreSQL 16 |
+| **Database** | PostgreSQL 15 / 16 |
 | **Database Driver & Abstraction** | `lib/pq` (`v1.10.9`) & `sqlx` (`v1.4.0`) |
 | **Migration Tooling** | `golang-migrate/migrate` (`v4.17.1`) |
 | **Auth & Security** | `golang-jwt/jwt` (`v5.2.2`), `golang.org/x/crypto/bcrypt` |
 | **Validation** | `go-playground/validator` (`v10.22.0`) |
 | **UUID Generator** | `google/uuid` (`v1.6.0`) |
+| **Observability** | Prometheus client (`prometheus/client_golang`) |
 | **SQL Testing** | `DATA-DOG/go-sqlmock` (`v1.5.2`) |
+| **Container** | Docker (multi-stage, `alpine:3.19`) |
+| **CI** | GitHub Actions (`ubuntu-latest`, `postgres:15-alpine`) |
 
 ---
 
@@ -27,9 +30,10 @@ PostgreSQL serves as the single source of truth and transactional boundary for b
 Detailed architectural decision records and system design choices are documented in [`ARCHITECTURE.md`](ARCHITECTURE.md). Key implementation highlights include:
 
 ### 1. Identity, Access & Session Management (`internal/service/auth` & `internal/httpapi/middleware`)
-- **Stateless Bearer JWT Authentication:** Issues access JWTs signed with HMAC-SHA256 (`JWT_SECRET`) carrying `sub`, `username`, `role`, `iat`, and `exp` (15m TTL). Middleware explicitly verifies HMAC signing (`*jwt.SigningMethodHMAC`) to prevent `none` algorithm & key-confusion attacks.
+- **Stateless Bearer JWT Authentication:** Issues access JWTs signed with HMAC-SHA256 (`JWT_SECRET`) carrying `sub`, `username`, `role`, `iss`, `aud`, `iat`, and `exp` (15m TTL). Middleware explicitly verifies HMAC signing (`*jwt.SigningMethodHMAC`) and validates mandatory `iss` and `aud` claims to prevent `none` algorithm & key-confusion attacks.
 - **PostgreSQL-Backed Refresh Rotation:** Cryptographic UUID v4 refresh tokens are stored solely as SHA-256 hashes (`token_hash`). Plaintext tokens are never persisted or logged. `POST /auth/refresh` executes atomic session rotation (`revoked_at = now()`, `replaced_by_id = new_session.id`) and new session insertion in a single PostgreSQL transaction.
 - **Single-Winner Race Protection:** PostgreSQL row-level locks and `UPDATE ... WHERE token_hash = $1 AND revoked_at IS NULL AND expires_at > $1` ensure N concurrent refresh requests produce exactly one winner (`RowsAffected == 1`). All concurrent losers or reused tokens receive `401 INVALID_REFRESH_TOKEN`.
+- **IP Rate Limiting:** `/auth/login` and `/auth/refresh` are protected by an in-memory IP rate limiter (max 10 requests/minute per IP). Exceeded requests return `429 TOO_MANY_REQUESTS` with `Retry-After: 60`.
 - **Idempotent Logout:** `POST /auth/logout` atomically revokes refresh sessions. Repeated logouts return `204 No Content` without error.
 - **Role-Based Access Control (RBAC):** `RequireRole` middleware enforces role boundaries (`OPERATOR`, `ADMIN`, `SUPERADMIN`), returning `403 FORBIDDEN` when permissions are insufficient.
 
@@ -144,8 +148,8 @@ CREATE TABLE audit_outbox (
 
 | Method | Path | Description | Access |
 |---|---|---|---|
-| `POST` | `/auth/login` | Login with username and password | Public |
-| `POST` | `/auth/refresh` | Rotate refresh token for a new access token | Public |
+| `POST` | `/auth/login` | Login with username and password (rate limited: 10 req/min) | Public |
+| `POST` | `/auth/refresh` | Rotate refresh token for a new access token (rate limited: 10 req/min) | Public |
 | `POST` | `/auth/logout` | Revoke refresh token | Public |
 
 ### Protected Disbursement Endpoints (`/api/v1/disbursements`)
@@ -157,6 +161,12 @@ CREATE TABLE audit_outbox (
 | `GET` | `/api/v1/disbursements/:id` | Get disbursement detail by ID | `OPERATOR`, `ADMIN`, `SUPERADMIN` |
 | `PATCH` | `/api/v1/disbursements/:id/status` | Finalize disbursement (`APPROVED`/`REJECTED`) | `ADMIN`, `SUPERADMIN` |
 | `DELETE` | `/api/v1/disbursements/:id` | Soft delete pending disbursement | `SUPERADMIN` |
+
+### Internal Observability Endpoint
+
+| Method | Path | Description | Access |
+|---|---|---|---|
+| `GET` | `/metrics` | Prometheus operational metrics | `X-Metrics-Token` header required |
 
 ---
 
@@ -184,12 +194,16 @@ export HTTP_ADDRESS=":8080"
 |---|---|---|---|
 | `DATABASE_URL` | **Yes** | - | PostgreSQL connection DSN URL |
 | `JWT_SECRET` | **Yes** | - | Secret key for JWT signing and verification |
+| `JWT_ISSUER` | **Yes** | - | Expected JWT `iss` claim value |
+| `JWT_AUDIENCE` | **Yes** | - | Expected JWT `aud` claim value |
+| `METRICS_TOKEN` | **Yes** | - | Bearer token for `/metrics` endpoint (`X-Metrics-Token` header) |
 | `HTTP_ADDRESS` | No | `:8080` | Bind address for HTTP server |
 | `HTTP_READ_TIMEOUT` | No | `10s` | HTTP server read timeout |
 | `HTTP_WRITE_TIMEOUT` | No | `15s` | HTTP server write timeout |
 | `HTTP_IDLE_TIMEOUT` | No | `60s` | HTTP server idle connection timeout |
 | `SHUTDOWN_TIMEOUT` | No | `10s` | Maximum grace period for server shutdown |
 | `MAX_REQUEST_BODY_BYTES` | No | `1048576` | Maximum request body limit (default 1 MiB) |
+| `TRUSTED_PROXIES` | No | - | Comma-separated list of trusted reverse proxy CIDRs |
 | `DB_MAX_OPEN_CONNS` | No | `20` | Maximum open database pool connections |
 | `DB_MAX_IDLE_CONNS` | No | `10` | Maximum idle database pool connections |
 | `DB_CONN_MAX_LIFETIME` | No | `30m` | Connection maximum lifetime |
@@ -197,6 +211,9 @@ export HTTP_ADDRESS=":8080"
 | `REFRESH_TOKEN_TTL` | No | `168h` | Refresh Token duration (7 days) |
 | `IDEMPOTENCY_LEASE_TTL` | No | `30s` | Active idempotency claim lease duration |
 | `IDEMPOTENCY_REPLAY_TTL` | No | `24h` | Idempotency response replay retention |
+| `AUDIT_OUTBOX_BATCH_SIZE` | No | `100` | Number of outbox events claimed per relay cycle |
+| `AUDIT_RELAY_INTERVAL` | No | `5s` | Audit relay worker polling interval |
+| `AUDIT_RETENTION_DAYS` | No | `30` | Days before delivered outbox staging records are pruned |
 
 ---
 
@@ -226,11 +243,31 @@ go run ./cmd/api
 
 ### 4. Running the Test Suite
 
-Execute the deterministic unit test suite with statement coverage:
+Execute the deterministic unit test suite with race detection:
 
 ```bash
-# Run unit tests across all packages
-CGO_ENABLED=0 go test ./...
+# Run all unit tests with race detector
+go test -v -race ./...
+
+# Run with coverage profile
+go test -v -race -coverprofile=coverage.out ./...
+go tool cover -func=coverage.out
+```
+
+### 5. Docker Build & Run
+
+```bash
+# Build production image
+docker build -t disbursement-api:latest .
+
+# Run container
+docker run -p 8080:8080 \
+  -e DATABASE_URL="postgres://postgres:postgres@host.docker.internal:5432/disbursement_db?sslmode=disable" \
+  -e JWT_SECRET="your-secret-key-minimum-32-characters" \
+  -e JWT_ISSUER="disbursement-api" \
+  -e JWT_AUDIENCE="disbursement-api-users" \
+  -e METRICS_TOKEN="your-metrics-token" \
+  disbursement-api:latest
 ```
 
 ---
@@ -343,13 +380,16 @@ curl -i -X DELETE http://localhost:8080/api/v1/disbursements/<DISBURSEMENT_ID> \
 | `CONCURRENT_MODIFICATION` | `409` | Lost finalization race against concurrent request |
 | `IDEMPOTENCY_KEY_REUSED` | `409` | Idempotency key reused with different request payload |
 | `IDEMPOTENCY_REQUEST_IN_PROGRESS` | `409` | Idempotency key currently locked by active request |
+| `TOO_MANY_REQUESTS` | `429` | IP rate limit exceeded on `/auth/login` or `/auth/refresh` |
 | `INTERNAL_ERROR` | `500` | Unhandled internal error or panic |
 
 ---
 
 ## Observability & Structured Logging
 
-Every request generates a single structured JSON log emitted to `stdout`. Sensitive fields (`password`, `authorization`, `account_number`, `token`) are automatically masked into `[REDACTED]`.
+Every request generates a single structured JSON log emitted to `stdout`. Sensitive fields (`password`, `authorization`, `account_number`, `token`, `email`, `phone`, `tax_id`, `bank_account`) are automatically masked into `[REDACTED]`.
+
+Prometheus metrics are available at `GET /metrics` (requires `X-Metrics-Token` header). Tracked metrics include outbox backlog count, idempotency outcomes, finalization conflict counters, HTTP request latencies, and DB pool connection stats.
 
 Example Access Log:
 ```json

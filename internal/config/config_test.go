@@ -104,11 +104,13 @@ func setValidEnvironment(t *testing.T) {
 		"AUDIT_WARNING_AGE",
 		"AUDIT_CRITICAL_AGE",
 		"AUDIT_RECONCILIATION_INTERVAL",
+		"METRICS_TOKEN",
 	} {
 		t.Setenv(name, "")
 	}
 	t.Setenv("DATABASE_URL", testDatabaseURL)
 	t.Setenv("JWT_SECRET", testJWTSecret)
+	t.Setenv("METRICS_TOKEN", "test-metrics-token")
 }
 
 func TestLoadAllowsValidDurationOverride(t *testing.T) {
@@ -123,4 +125,80 @@ func TestLoadAllowsValidDurationOverride(t *testing.T) {
 	if configuration.HTTP.ReadTimeout != 25*time.Second {
 		t.Errorf("HTTP.ReadTimeout = %s, want 25s", configuration.HTTP.ReadTimeout)
 	}
+}
+
+func TestLoadRejectsInvalidTrustedProxy(t *testing.T) {
+	setValidEnvironment(t)
+	t.Setenv("HTTP_TRUSTED_PROXIES", "not-an-ip")
+
+	_, err := Load()
+
+	if err == nil || !strings.Contains(err.Error(), "HTTP_TRUSTED_PROXIES contains invalid IP or CIDR") {
+		t.Fatalf("Load() error = %v, want invalid trusted proxy error", err)
+	}
+}
+
+func TestLoadRejectsAllAddressTrustedProxy(t *testing.T) {
+	setValidEnvironment(t)
+	t.Setenv("HTTP_TRUSTED_PROXIES", "0.0.0.0/0")
+
+	_, err := Load()
+
+	if err == nil || !strings.Contains(err.Error(), "must not allow all addresses") {
+		t.Fatalf("Load() error = %v, want broad trusted proxy error", err)
+	}
+}
+
+func TestLoadRejectsInvalidInt64(t *testing.T) {
+	setValidEnvironment(t)
+	t.Setenv("MAX_REQUEST_BODY_BYTES", "not-a-number")
+
+	_, err := Load()
+	if err == nil || !strings.Contains(err.Error(), "MAX_REQUEST_BODY_BYTES must be an integer") {
+		t.Fatalf("expected int64 error, got %v", err)
+	}
+}
+
+func TestLoadRejectsInvalidValidationBranches(t *testing.T) {
+	t.Run("empty HTTP_ADDRESS in struct", func(t *testing.T) {
+		cfg := Config{}
+		if err := cfg.validate(); err == nil || !strings.Contains(err.Error(), "HTTP_ADDRESS must not be empty") {
+			t.Fatalf("expected HTTP_ADDRESS error, got %v", err)
+		}
+	})
+
+	t.Run("empty METRICS_TOKEN in struct", func(t *testing.T) {
+		cfg := Config{HTTP: HTTPConfig{Address: ":8080", MaxRequestBodyBytes: 1024}}
+		if err := cfg.validate(); err == nil || !strings.Contains(err.Error(), "METRICS_TOKEN must not be empty") {
+			t.Fatalf("expected METRICS_TOKEN error, got %v", err)
+		}
+	})
+
+	t.Run("invalid audit critical age", func(t *testing.T) {
+		setValidEnvironment(t)
+		t.Setenv("AUDIT_WARNING_AGE", "10m")
+		t.Setenv("AUDIT_CRITICAL_AGE", "5m")
+		_, err := Load()
+		if err == nil || !strings.Contains(err.Error(), "audit duration configuration is invalid") {
+			t.Fatalf("expected audit error, got %v", err)
+		}
+	})
+
+	t.Run("invalid access token TTL", func(t *testing.T) {
+		setValidEnvironment(t)
+		t.Setenv("ACCESS_TOKEN_TTL", "-1m")
+		_, err := Load()
+		if err == nil || !strings.Contains(err.Error(), "must be a positive duration") {
+			t.Fatalf("expected TTL error, got %v", err)
+		}
+	})
+
+	t.Run("invalid database URL scheme", func(t *testing.T) {
+		setValidEnvironment(t)
+		t.Setenv("DATABASE_URL", "http://localhost:5432/db")
+		_, err := Load()
+		if err == nil || !strings.Contains(err.Error(), "DATABASE_URL must be a valid PostgreSQL URL") {
+			t.Fatalf("expected database URL scheme error, got %v", err)
+		}
+	})
 }

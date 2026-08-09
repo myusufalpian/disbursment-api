@@ -1,0 +1,70 @@
+name: Continuous Integration
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
+
+jobs:
+  test-and-build:
+    name: Build, Test & Container Check
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: disbursement_api
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Verify Go toolchain
+        run: |
+          go version
+          go env GOVERSION GOROOT GOARCH
+
+      - name: Install Go dependencies
+        run: go mod download
+
+      - name: Verify code formatting & vet
+        run: |
+          go vet ./...
+
+      - name: Run unit & integration tests with race detector
+        env:
+          DB_HOST: localhost
+          DB_PORT: 5432
+          DB_USER: postgres
+          DB_PASSWORD: postgres
+          DB_NAME: disbursement_api
+          DB_SSLMODE: disable
+        run: |
+          test_packages=()
+          while IFS= read -r package; do
+            if [[ -n "$package" ]]; then
+              test_packages+=("$package")
+            fi
+          done < <(go list -f '{{if or .TestGoFiles .XTestGoFiles}}{{.ImportPath}}{{end}}' ./...)
+          go test -v -race -coverprofile=coverage.out "${test_packages[@]}"
+
+      - name: Smoke test Docker build
+        run: |
+          docker build -t disbursement-api:latest .

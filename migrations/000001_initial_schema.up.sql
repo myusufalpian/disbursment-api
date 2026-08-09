@@ -101,9 +101,15 @@ CREATE TABLE audit_outbox (
     CONSTRAINT audit_outbox_attempts_check CHECK (delivery_attempts >= 0)
 );
 
+-- RETENTION ARCHITECTURE DESIGN:
+-- audit_outbox is a transactional staging table for event-driven relay delivery.
+-- audit_logs is the immutable, long-term queryable historical audit projection table.
+-- source_event_id stores the outbox event UUID as an origin tracking identifier without a database FK constraint.
+-- This decouples audit_logs retention from audit_outbox cleanup (CleanupDelivered), ensuring historical
+-- audit logs are preserved forever when outbox staging records >30 days are pruned.
 CREATE TABLE audit_logs (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    source_event_id UUID NOT NULL UNIQUE REFERENCES audit_outbox(event_id) ON DELETE RESTRICT,
+    source_event_id UUID NOT NULL UNIQUE,
     entity_type VARCHAR(64) NOT NULL,
     entity_id UUID NOT NULL,
     action VARCHAR(64) NOT NULL,

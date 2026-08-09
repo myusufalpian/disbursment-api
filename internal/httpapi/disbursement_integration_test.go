@@ -99,6 +99,21 @@ func (m *mockAuditOutboxStore) Insert(ctx context.Context, tx repository.Transac
 	m.events = append(m.events, event)
 	return nil
 }
+func (m *mockAuditOutboxStore) FetchPending(ctx context.Context, limit int) ([]domain.AuditEvent, error) {
+	return nil, nil
+}
+func (m *mockAuditOutboxStore) MarkDelivered(ctx context.Context, eventID uuid.UUID, deliveredAt time.Time) error {
+	return nil
+}
+func (m *mockAuditOutboxStore) RecordFailure(ctx context.Context, eventID uuid.UUID, errMessage string, nextAvailableAt time.Time) error {
+	return nil
+}
+func (m *mockAuditOutboxStore) ReconcilePending(ctx context.Context, minAge time.Duration) (int, int, error) {
+	return 0, 0, nil
+}
+func (m *mockAuditOutboxStore) CleanupDelivered(ctx context.Context, olderThan time.Duration) (int64, error) {
+	return 0, nil
+}
 
 type mockTransactor struct{}
 type mockTransaction struct{}
@@ -113,6 +128,8 @@ func generateTestToken(secret string, userID uuid.UUID, role domain.UserRole) st
 		"sub":      userID.String(),
 		"username": "test_user",
 		"role":     string(role),
+		"iss":      "disbursement-api",
+		"aud":      "disbursement-api-users",
 		"exp":      time.Now().Add(time.Hour).Unix(),
 	})
 	tokenStr, _ := token.SignedString([]byte(secret))
@@ -133,7 +150,7 @@ func TestDisbursementEndpointsIntegration(t *testing.T) {
 	outboxStore := &mockAuditOutboxStore{}
 	transactor := mockTransactor{}
 
-	disbursementService, err := disbursement.NewService(store, outboxStore, transactor, nil)
+	disbursementService, err := disbursement.NewService(store, outboxStore, transactor, nil, nil)
 	if err != nil {
 		t.Fatalf("failed to create disbursement service: %v", err)
 	}
@@ -145,7 +162,10 @@ func TestDisbursementEndpointsIntegration(t *testing.T) {
 
 	handler := httpapi.NewDisbursementHandler(disbursementService, validatorEngine)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	router := httpapi.NewRouter(1<<20, logger, jwtSecret, nil, handler)
+	router, err := httpapi.NewRouter(1<<20, logger, jwtSecret, "disbursement-api", "disbursement-api-users", nil, handler, nil, "test-metrics-token", nil)
+	if err != nil {
+		t.Fatalf("router init failed: %v", err)
+	}
 
 	var createdID string
 
@@ -321,6 +341,105 @@ func TestDisbursementEndpointsIntegration(t *testing.T) {
 
 		if w.Code != http.StatusBadRequest && w.Code != http.StatusConflict {
 			t.Fatalf("expected 400 or 409 when deleting approved disbursement, got %d: %s", w.Code, w.Body.String())
+		}
+	})
+
+	t.Run("POST /disbursements - Malformed JSON and Validation Failure", func(t *testing.T) {
+		// 1. Malformed JSON
+		req1, _ := http.NewRequest(http.MethodPost, "/disbursements", bytes.NewReader([]byte(`{invalid`)))
+		req1.Header.Set("Content-Type", "application/json")
+		req1.Header.Set("Authorization", "Bearer "+operatorToken)
+		w1 := httptest.NewRecorder()
+		router.ServeHTTP(w1, req1)
+		if w1.Code != http.StatusBadRequest {
+			t.Errorf("expected 400 Bad Request for malformed JSON, got %d", w1.Code)
+		}
+
+		// 2. Validation failure (missing RecipientName)
+		body, _ := json.Marshal(dto.CreateDisbursementRequest{
+			RecipientName: "",
+			AccountNumber: "1234567890",
+			BankCode:      "BCA",
+			Amount:        100000,
+		})
+		req2, _ := http.NewRequest(http.MethodPost, "/disbursements", bytes.NewReader(body))
+		req2.Header.Set("Content-Type", "application/json")
+		req2.Header.Set("Authorization", "Bearer "+operatorToken)
+		w2 := httptest.NewRecorder()
+		router.ServeHTTP(w2, req2)
+		if w2.Code != http.StatusBadRequest {
+			t.Errorf("expected 400 Bad Request for validation failure, got %d", w2.Code)
+		}
+	})
+
+	t.Run("GET /disbursements - Valid and Inverted Date Ranges", func(t *testing.T) {
+		// 1. Valid date range
+		req1, _ := http.NewRequest(http.MethodGet, "/disbursements?date_from=2026-01-01&date_to=2026-01-02", nil)
+		req1.Header.Set("Authorization", "Bearer "+operatorToken)
+		w1 := httptest.NewRecorder()
+		router.ServeHTTP(w1, req1)
+		if w1.Code != http.StatusOK {
+			t.Errorf("expected 200 OK for valid date range, got %d", w1.Code)
+		}
+
+		// 2. Inverted date range (from > to)
+		req2, _ := http.NewRequest(http.MethodGet, "/disbursements?date_from=2026-01-02&date_to=2026-01-01", nil)
+		req2.Header.Set("Authorization", "Bearer "+operatorToken)
+		w2 := httptest.NewRecorder()
+		router.ServeHTTP(w2, req2)
+		if w2.Code != http.StatusBadRequest {
+			t.Errorf("expected 400 Bad Request for inverted date range, got %d", w2.Code)
+		}
+
+		// 3. Single date_from specified
+		req3, _ := http.NewRequest(http.MethodGet, "/disbursements?date_from=2026-01-01", nil)
+		req3.Header.Set("Authorization", "Bearer "+operatorToken)
+		w3 := httptest.NewRecorder()
+		router.ServeHTTP(w3, req3)
+		if w3.Code != http.StatusOK {
+			t.Errorf("expected 200 OK for date_from, got %d", w3.Code)
+		}
+	})
+
+	t.Run("PATCH /disbursements/:id/status - Invalid UUID, Malformed JSON, Validation Failure", func(t *testing.T) {
+		// 1. Invalid UUID
+		req1, _ := http.NewRequest(http.MethodPatch, "/disbursements/invalid-uuid/status", nil)
+		req1.Header.Set("Authorization", "Bearer "+adminToken)
+		w1 := httptest.NewRecorder()
+		router.ServeHTTP(w1, req1)
+		if w1.Code != http.StatusNotFound {
+			t.Errorf("expected 404 for invalid UUID, got %d", w1.Code)
+		}
+
+		// 2. Malformed JSON
+		req2, _ := http.NewRequest(http.MethodPatch, "/disbursements/"+createdID+"/status", bytes.NewReader([]byte(`{invalid`)))
+		req2.Header.Set("Content-Type", "application/json")
+		req2.Header.Set("Authorization", "Bearer "+adminToken)
+		w2 := httptest.NewRecorder()
+		router.ServeHTTP(w2, req2)
+		if w2.Code != http.StatusBadRequest {
+			t.Errorf("expected 400 for malformed JSON, got %d", w2.Code)
+		}
+
+		// 3. Validation failure (invalid status)
+		body, _ := json.Marshal(dto.UpdateDisbursementStatusRequest{Status: "UNKNOWN_STATUS"})
+		req3, _ := http.NewRequest(http.MethodPatch, "/disbursements/"+createdID+"/status", bytes.NewReader(body))
+		req3.Header.Set("Content-Type", "application/json")
+		req3.Header.Set("Authorization", "Bearer "+adminToken)
+		w3 := httptest.NewRecorder()
+		router.ServeHTTP(w3, req3)
+		if w3.Code != http.StatusBadRequest {
+			t.Errorf("expected 400 for invalid status, got %d", w3.Code)
+		}
+	})
+
+	t.Run("DELETE /disbursements/:id - Invalid UUID path", func(t *testing.T) {
+		req, _ := http.NewRequest(http.MethodDelete, "/disbursements/not-a-uuid", nil)
+		req.Header.Set("Authorization", "Bearer "+superadminToken)
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		if w.Code != http.StatusNotFound {
+			t.Errorf("expected 404 Not Found, got %d", w.Code)
 		}
 	})
 }

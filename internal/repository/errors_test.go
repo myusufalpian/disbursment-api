@@ -1,11 +1,14 @@
 package repository_test
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"testing"
 
 	"disbursment-api/internal/repository"
+
+	"github.com/lib/pq"
 )
 
 func TestRepositoryErrorHelpers(t *testing.T) {
@@ -53,6 +56,38 @@ func TestRepositoryErrorHelpers(t *testing.T) {
 		}
 		if dependencyErr.Error() == "" {
 			t.Errorf("expected non-empty Error()")
+		}
+	})
+
+	t.Run("Classify Postgres and Context Errors", func(t *testing.T) {
+		// 1. Existing *Error returns as-is
+		if repository.Classify(notFoundErr) != notFoundErr {
+			t.Errorf("expected original repository error returned")
+		}
+
+		// 2. Context errors
+		if repository.Classify(context.Canceled).Category != repository.ErrorDependency {
+			t.Errorf("expected ErrorDependency for context.Canceled")
+		}
+		if repository.Classify(context.DeadlineExceeded).Category != repository.ErrorDependency {
+			t.Errorf("expected ErrorDependency for context.DeadlineExceeded")
+		}
+
+		// 3. Postgres error codes
+		pqConflict := &pq.Error{Code: "23505"}
+		if repository.Classify(pqConflict).Category != repository.ErrorConflict {
+			t.Errorf("expected ErrorConflict for pq 23505")
+		}
+
+		pqConstraint := &pq.Error{Code: "23503"}
+		if repository.Classify(pqConstraint).Category != repository.ErrorConstraint {
+			t.Errorf("expected ErrorConstraint for pq 23503")
+		}
+
+		// 4. Fallback generic error
+		genericErr := errors.New("unknown error")
+		if repository.Classify(genericErr).Category != repository.ErrorDependency {
+			t.Errorf("expected ErrorDependency for generic error")
 		}
 	})
 }

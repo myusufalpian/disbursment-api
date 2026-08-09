@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"disbursment-api/internal/domain"
+	"disbursment-api/internal/observability/metrics"
 	"disbursment-api/internal/repository"
 
 	"github.com/google/uuid"
@@ -24,6 +25,7 @@ type Coordinator struct {
 	store     repository.IdempotencyStore
 	clock     Clock
 	generator UUIDGenerator
+	metrics   *metrics.MetricsCollector
 	leaseTTL  time.Duration
 	replayTTL time.Duration
 }
@@ -32,15 +34,22 @@ type systemClock struct{}
 
 type randomUUIDGenerator struct{}
 
-func NewCoordinator(store repository.IdempotencyStore, clock Clock, generator UUIDGenerator, leaseTTL time.Duration, replayTTL time.Duration) (*Coordinator, error) {
+func NewCoordinator(store repository.IdempotencyStore, clock Clock, generator UUIDGenerator, leaseTTL time.Duration, replayTTL time.Duration, metricsCollector *metrics.MetricsCollector) (*Coordinator, error) {
 	if store == nil || clock == nil || generator == nil || leaseTTL <= 0 || replayTTL <= leaseTTL {
 		return nil, fmt.Errorf("invalid idempotency coordinator configuration")
 	}
-	return &Coordinator{store: store, clock: clock, generator: generator, leaseTTL: leaseTTL, replayTTL: replayTTL}, nil
+	return &Coordinator{
+		store:     store,
+		clock:     clock,
+		generator: generator,
+		metrics:   metricsCollector,
+		leaseTTL:  leaseTTL,
+		replayTTL: replayTTL,
+	}, nil
 }
 
-func NewDefaultCoordinator(store repository.IdempotencyStore, leaseTTL time.Duration, replayTTL time.Duration) (*Coordinator, error) {
-	return NewCoordinator(store, systemClock{}, randomUUIDGenerator{}, leaseTTL, replayTTL)
+func NewDefaultCoordinator(store repository.IdempotencyStore, leaseTTL time.Duration, replayTTL time.Duration, metricsCollector *metrics.MetricsCollector) (*Coordinator, error) {
+	return NewCoordinator(store, systemClock{}, randomUUIDGenerator{}, leaseTTL, replayTTL, metricsCollector)
 }
 
 func (coordinator *Coordinator) Claim(ctx context.Context, userID uuid.UUID, method string, endpoint string, keyValue string, payload any) (domain.IdempotencyClaimResult, error) {
@@ -66,7 +75,11 @@ func (coordinator *Coordinator) Claim(ctx context.Context, userID uuid.UUID, met
 		ExpiresAt:   now.Add(coordinator.replayTTL),
 		Now:         now,
 	}
-	return coordinator.store.Acquire(ctx, request)
+	result, err := coordinator.store.Acquire(ctx, request)
+	if err == nil && result.Outcome != "" && coordinator.metrics != nil {
+		coordinator.metrics.RecordIdempotencyClaim(string(result.Outcome))
+	}
+	return result, err
 }
 
 func (coordinator *Coordinator) VerifyOwnership(ctx context.Context, transaction repository.Transaction, scope domain.IdempotencyScope, claimID uuid.UUID) error {

@@ -1,0 +1,12 @@
+.git
+.gitignore
+.agents
+.codex
+.idea
+.kiro
+graphify-out
+kiro-task
+skill-observations
+coverage.out
+*.log
+tmp/

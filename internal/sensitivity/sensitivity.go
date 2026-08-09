@@ -7,5 +7,9 @@ func IsSensitiveKey(key string) bool {
 	return strings.Contains(normalized, "password") ||
 		strings.Contains(normalized, "authorization") ||
 		strings.Contains(normalized, "account_number") ||
+		strings.Contains(normalized, "bank_account") ||
+		strings.Contains(normalized, "email") ||
+		strings.Contains(normalized, "phone") ||
+		strings.Contains(normalized, "tax_id") ||
 		strings.Contains(normalized, "token")
 }

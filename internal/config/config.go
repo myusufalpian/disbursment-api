@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"strconv"
@@ -44,6 +45,8 @@ type HTTPConfig struct {
 	IdleTimeout         time.Duration
 	ShutdownTimeout     time.Duration
 	MaxRequestBodyBytes int64
+	MetricsToken        string
+	TrustedProxies      []string
 }
 
 type DatabaseConfig struct {
@@ -55,6 +58,8 @@ type DatabaseConfig struct {
 
 type SecurityConfig struct {
 	JWTSecret       string
+	JWTIssuer       string
+	JWTAudience     string
 	AccessTokenTTL  time.Duration
 	RefreshTokenTTL time.Duration
 }
@@ -80,11 +85,32 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	metricsToken, err := required("METRICS_TOKEN")
+	if err != nil {
+		return Config{}, err
+	}
+
+	var trustedProxies []string
+	if rawProxies := stringValue("HTTP_TRUSTED_PROXIES", ""); rawProxies != "" {
+		for _, p := range strings.Split(rawProxies, ",") {
+			if trimmed := strings.TrimSpace(p); trimmed != "" {
+				trustedProxies = append(trustedProxies, trimmed)
+			}
+		}
+	}
 
 	config := Config{
-		HTTP:     HTTPConfig{Address: stringValue("HTTP_ADDRESS", defaultHTTPAddress)},
+		HTTP: HTTPConfig{
+			Address:        stringValue("HTTP_ADDRESS", defaultHTTPAddress),
+			MetricsToken:   metricsToken,
+			TrustedProxies: trustedProxies,
+		},
 		Database: DatabaseConfig{URL: databaseURL},
-		Security: SecurityConfig{JWTSecret: jwtSecret},
+		Security: SecurityConfig{
+			JWTSecret:   jwtSecret,
+			JWTIssuer:   stringValue("JWT_ISSUER", "disbursement-api"),
+			JWTAudience: stringValue("JWT_AUDIENCE", "disbursement-api-users"),
+		},
 	}
 	if config.HTTP.ReadTimeout, err = readDuration("HTTP_READ_TIMEOUT", defaultHTTPReadTimeout); err != nil {
 		return Config{}, err
@@ -196,6 +222,14 @@ func (c Config) validate() error {
 	if c.HTTP.MaxRequestBodyBytes <= 0 {
 		return fmt.Errorf("MAX_REQUEST_BODY_BYTES must be greater than zero")
 	}
+	if strings.TrimSpace(c.HTTP.MetricsToken) == "" {
+		return fmt.Errorf("METRICS_TOKEN must not be empty")
+	}
+	for _, proxy := range c.HTTP.TrustedProxies {
+		if err := validateTrustedProxy(proxy); err != nil {
+			return err
+		}
+	}
 	if c.Database.MaxOpenConnections <= 0 || c.Database.MaxIdleConnections < 0 || c.Database.MaxIdleConnections > c.Database.MaxOpenConnections {
 		return fmt.Errorf("database pool limits are invalid")
 	}
@@ -204,6 +238,25 @@ func (c Config) validate() error {
 	}
 	if c.Audit.OutboxRetention <= 0 || c.Audit.WarningAge <= 0 || c.Audit.CriticalAge <= c.Audit.WarningAge || c.Audit.ReconciliationInterval <= 0 {
 		return fmt.Errorf("audit duration configuration is invalid")
+	}
+	return nil
+}
+
+func validateTrustedProxy(proxy string) error {
+	proxy = strings.TrimSpace(proxy)
+	if proxy == "" {
+		return fmt.Errorf("HTTP_TRUSTED_PROXIES must not contain empty values")
+	}
+	if ip := net.ParseIP(proxy); ip != nil {
+		return nil
+	}
+	_, network, err := net.ParseCIDR(proxy)
+	if err != nil {
+		return fmt.Errorf("HTTP_TRUSTED_PROXIES contains invalid IP or CIDR %q", proxy)
+	}
+	ones, bits := network.Mask.Size()
+	if ones == 0 && bits > 0 {
+		return fmt.Errorf("HTTP_TRUSTED_PROXIES must not allow all addresses: %q", proxy)
 	}
 	return nil
 }

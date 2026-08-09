@@ -9,6 +9,7 @@ import (
 
 	"disbursment-api/internal/domain"
 	"disbursment-api/internal/httpapi/dto"
+	"disbursment-api/internal/observability/metrics"
 	"disbursment-api/internal/repository"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -20,7 +21,10 @@ type Service struct {
 	userStore       repository.UserStore
 	sessionStore    repository.RefreshSessionStore
 	transactor      repository.Transactor
+	metrics         *metrics.MetricsCollector
 	jwtSecret       []byte
+	jwtIssuer       string
+	jwtAudience     string
 	accessTokenTTL  time.Duration
 	refreshTokenTTL time.Duration
 	nowFunc         func() time.Time
@@ -33,12 +37,46 @@ func NewService(
 	jwtSecret string,
 	accessTokenTTL time.Duration,
 	refreshTokenTTL time.Duration,
+	metricsCollector *metrics.MetricsCollector,
 ) *Service {
+	return NewServiceWithIssuerAudience(
+		userStore,
+		sessionStore,
+		transactor,
+		jwtSecret,
+		"disbursement-api",
+		"disbursement-api-users",
+		accessTokenTTL,
+		refreshTokenTTL,
+		metricsCollector,
+	)
+}
+
+func NewServiceWithIssuerAudience(
+	userStore repository.UserStore,
+	sessionStore repository.RefreshSessionStore,
+	transactor repository.Transactor,
+	jwtSecret string,
+	jwtIssuer string,
+	jwtAudience string,
+	accessTokenTTL time.Duration,
+	refreshTokenTTL time.Duration,
+	metricsCollector *metrics.MetricsCollector,
+) *Service {
+	if jwtIssuer == "" {
+		jwtIssuer = "disbursement-api"
+	}
+	if jwtAudience == "" {
+		jwtAudience = "disbursement-api-users"
+	}
 	return &Service{
 		userStore:       userStore,
 		sessionStore:    sessionStore,
 		transactor:      transactor,
+		metrics:         metricsCollector,
 		jwtSecret:       []byte(jwtSecret),
+		jwtIssuer:       jwtIssuer,
+		jwtAudience:     jwtAudience,
 		accessTokenTTL:  accessTokenTTL,
 		refreshTokenTTL: refreshTokenTTL,
 		nowFunc:         time.Now,
@@ -50,12 +88,18 @@ func (s *Service) Login(ctx context.Context, req dto.LoginRequest) (*dto.TokenRe
 	if err != nil {
 		var repoErr *repository.Error
 		if errors.As(err, &repoErr) && repoErr.Category == repository.ErrorNotFound {
+			if s.metrics != nil {
+				s.metrics.RecordAuthFailure("invalid_credentials")
+			}
 			return nil, domain.InvalidCredentials()
 		}
 		return nil, err
 	}
 
 	if err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(req.Password)); err != nil {
+		if s.metrics != nil {
+			s.metrics.RecordAuthFailure("invalid_credentials")
+		}
 		return nil, domain.InvalidCredentials()
 	}
 
@@ -148,6 +192,9 @@ func (s *Service) Refresh(ctx context.Context, req dto.RefreshRequest) (*dto.Tok
 	})
 
 	if err != nil {
+		if s.metrics != nil {
+			s.metrics.RecordAuthFailure("invalid_refresh_token")
+		}
 		return nil, err
 	}
 
@@ -178,6 +225,8 @@ func (s *Service) generateAccessToken(user repository.User, now time.Time) (stri
 		"sub":      user.ID.String(),
 		"username": user.Username,
 		"role":     user.Role,
+		"iss":      s.jwtIssuer,
+		"aud":      s.jwtAudience,
 		"iat":      now.Unix(),
 		"exp":      now.Add(s.accessTokenTTL).Unix(),
 	}
