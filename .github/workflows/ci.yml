@@ -33,8 +33,13 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.21'
+          go-version-file: go.mod
           cache: true
+
+      - name: Verify Go toolchain
+        run: |
+          go version
+          go env GOVERSION GOROOT GOARCH
 
       - name: Install Go dependencies
         run: go mod download
@@ -52,7 +57,13 @@ jobs:
           DB_NAME: disbursement_api
           DB_SSLMODE: disable
         run: |
-          go test -v -race -coverprofile=coverage.out ./...
+          test_packages=()
+          while IFS= read -r package; do
+            if [[ -n "$package" ]]; then
+              test_packages+=("$package")
+            fi
+          done < <(go list -f '{{if or .TestGoFiles .XTestGoFiles}}{{.ImportPath}}{{end}}' ./...)
+          go test -v -race -coverprofile=coverage.out "${test_packages[@]}"
 
       - name: Smoke test Docker build
         run: |
