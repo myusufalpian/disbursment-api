@@ -40,7 +40,7 @@ func TestAuthenticateMiddleware(t *testing.T) {
 	setupRouter := func() *gin.Engine {
 		r := gin.New()
 		r.Use(RequestID())
-		r.Use(Authenticate(secret))
+		r.Use(Authenticate(secret, "", "", nil))
 		r.GET("/protected", func(c *gin.Context) {
 			identity, ok := UserIdentityFromContext(c.Request.Context())
 			if !ok {
@@ -139,6 +139,55 @@ func TestRequireRoleMiddleware(t *testing.T) {
 
 		if w.Code != http.StatusOK {
 			t.Errorf("expected status 200, got %d", w.Code)
+		}
+	})
+
+	t.Run("issuer mismatch returns 401 UNAUTHORIZED", func(t *testing.T) {
+		sec := "secret"
+		tToken := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+			"sub":      uuid.New().String(),
+			"username": "user1",
+			"role":     "ADMIN",
+			"iss":      "wrong-issuer",
+			"exp":      time.Now().Add(1 * time.Hour).Unix(),
+		})
+		tStr, _ := tToken.SignedString([]byte(sec))
+
+		r := gin.New()
+		r.Use(Authenticate(sec, "expected-issuer", "", nil))
+		r.GET("/protected", func(c *gin.Context) { c.String(http.StatusOK, "OK") })
+
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest(http.MethodGet, "/protected", nil)
+		req.Header.Set("Authorization", "Bearer "+tStr)
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusUnauthorized {
+			t.Errorf("expected 401 Unauthorized on issuer mismatch, got %d", w.Code)
+		}
+	})
+
+	t.Run("missing issuer claim returns 401 UNAUTHORIZED", func(t *testing.T) {
+		sec := "secret"
+		tToken := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+			"sub":      uuid.New().String(),
+			"username": "user1",
+			"role":     "ADMIN",
+			"exp":      time.Now().Add(1 * time.Hour).Unix(),
+		})
+		tStr, _ := tToken.SignedString([]byte(sec))
+
+		r := gin.New()
+		r.Use(Authenticate(sec, "expected-issuer", "", nil))
+		r.GET("/protected", func(c *gin.Context) { c.String(http.StatusOK, "OK") })
+
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest(http.MethodGet, "/protected", nil)
+		req.Header.Set("Authorization", "Bearer "+tStr)
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusUnauthorized {
+			t.Errorf("expected 401 Unauthorized on missing issuer, got %d", w.Code)
 		}
 	})
 }

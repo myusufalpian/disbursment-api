@@ -135,7 +135,7 @@ func TestAuthService_Login(t *testing.T) {
 	userStore.users[user.Username] = user
 	userStore.byID[user.ID] = user
 
-	authService := NewService(userStore, sessionStore, transactor, "super-secret-key", 15*time.Minute, 7*24*time.Hour)
+	authService := NewService(userStore, sessionStore, transactor, "super-secret-key", 15*time.Minute, 7*24*time.Hour, nil)
 
 	t.Run("successful login", func(t *testing.T) {
 		resp, err := authService.Login(context.Background(), dto.LoginRequest{
@@ -179,17 +179,17 @@ func TestAuthService_Login(t *testing.T) {
 	t.Run("database error on find by username returns error", func(t *testing.T) {
 		errStore := newMockUserStore()
 		errStore.errToReturn = errors.New("db connection failure")
-		svc := NewService(errStore, sessionStore, transactor, "secret", 15*time.Minute, 7*24*time.Hour)
-		_, err := svc.Login(context.Background(), dto.LoginRequest{Username: "testadmin", Password: "any"})
+		svc := NewService(errStore, sessionStore, transactor, "secret", 15*time.Minute, 7*24*time.Hour, nil)
+		_, err := svc.Login(context.Background(), dto.LoginRequest{Username: "test", Password: "pwd"})
 		if err == nil {
-			t.Fatalf("expected error, got nil")
+			t.Error("expected error on user store failure")
 		}
 	})
 
-	t.Run("database error on session create returns error", func(t *testing.T) {
+	t.Run("session store create error", func(t *testing.T) {
 		errSessionStore := newMockSessionStore()
-		errSessionStore.errToReturn = errors.New("db insert failure")
-		svc := NewService(userStore, errSessionStore, transactor, "secret", 15*time.Minute, 7*24*time.Hour)
+		errSessionStore.errToReturn = errors.New("db error")
+		svc := NewService(userStore, errSessionStore, transactor, "secret", 15*time.Minute, 7*24*time.Hour, nil)
 		_, err := svc.Login(context.Background(), dto.LoginRequest{Username: "testadmin", Password: password})
 		if err == nil {
 			t.Fatalf("expected error, got nil")
@@ -212,7 +212,7 @@ func TestAuthService_Refresh(t *testing.T) {
 	userStore.users[user.Username] = user
 	userStore.byID[user.ID] = user
 
-	authService := NewService(userStore, sessionStore, transactor, "super-secret-key", 15*time.Minute, 7*24*time.Hour)
+	authService := NewService(userStore, sessionStore, transactor, "super-secret-key", 15*time.Minute, 7*24*time.Hour, nil)
 
 	refreshTokenStr := "initial-refresh-token"
 	h := sha256.Sum256([]byte(refreshTokenStr))
@@ -318,10 +318,10 @@ func TestAuthService_Refresh(t *testing.T) {
 	t.Run("database error on FindByTokenHash propagates error", func(t *testing.T) {
 		errSessionStore := newMockSessionStore()
 		errSessionStore.errToReturn = errors.New("db failure")
-		svc := NewService(userStore, errSessionStore, transactor, "secret", 15*time.Minute, 7*24*time.Hour)
+		svc := NewService(userStore, errSessionStore, transactor, "secret", 15*time.Minute, 7*24*time.Hour, nil)
 		_, err := svc.Refresh(context.Background(), dto.RefreshRequest{RefreshToken: "valid-token"})
 		if err == nil {
-			t.Fatalf("expected error, got nil")
+			t.Error("expected error on session find failure")
 		}
 	})
 }
@@ -331,7 +331,7 @@ func TestAuthService_Logout(t *testing.T) {
 	sessionStore := newMockSessionStore()
 	transactor := &mockTransactor{}
 
-	authService := NewService(userStore, sessionStore, transactor, "super-secret-key", 15*time.Minute, 7*24*time.Hour)
+	authService := NewService(userStore, sessionStore, transactor, "super-secret-key", 15*time.Minute, 7*24*time.Hour, nil)
 
 	refreshTokenStr := "logout-refresh-token"
 	h := sha256.Sum256([]byte(refreshTokenStr))
@@ -378,7 +378,7 @@ func TestAuthService_Logout(t *testing.T) {
 	t.Run("database error on logout propagates error", func(t *testing.T) {
 		errSessionStore := newMockSessionStore()
 		errSessionStore.errToReturn = errors.New("db failure")
-		svc := NewService(userStore, errSessionStore, transactor, "secret", 15*time.Minute, 7*24*time.Hour)
+		svc := NewService(userStore, errSessionStore, transactor, "secret", 15*time.Minute, 7*24*time.Hour, nil)
 		err := svc.Logout(context.Background(), dto.LogoutRequest{RefreshToken: "valid-token"})
 		if err == nil {
 			t.Fatalf("expected error on logout db failure, got nil")

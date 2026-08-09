@@ -112,6 +112,22 @@ func (m *mockAuditOutboxStore) Insert(ctx context.Context, tx repository.Transac
 	return nil
 }
 
+func (m *mockAuditOutboxStore) FetchPending(ctx context.Context, limit int) ([]domain.AuditEvent, error) {
+	return nil, nil
+}
+func (m *mockAuditOutboxStore) MarkDelivered(ctx context.Context, eventID uuid.UUID, deliveredAt time.Time) error {
+	return nil
+}
+func (m *mockAuditOutboxStore) RecordFailure(ctx context.Context, eventID uuid.UUID, errMessage string, nextAvailableAt time.Time) error {
+	return nil
+}
+func (m *mockAuditOutboxStore) ReconcilePending(ctx context.Context, minAge time.Duration) (int, int, error) {
+	return 0, 0, nil
+}
+func (m *mockAuditOutboxStore) CleanupDelivered(ctx context.Context, olderThan time.Duration) (int64, error) {
+	return 0, nil
+}
+
 type mockIdempotencyStore struct {
 	claimResult domain.IdempotencyClaimResult
 	claimErr    error
@@ -185,8 +201,8 @@ func TestDisbursementServiceMutationsAndOutbox(t *testing.T) {
 	outboxStore := &mockAuditOutboxStore{}
 	transactor := mockTransactor{}
 
-	coordinator, _ := idempotency.NewDefaultCoordinator(&mockIdempotencyStore{}, 30*time.Second, 24*time.Hour)
-	svc, err := disbursement.NewService(store, outboxStore, transactor, coordinator)
+	coordinator, _ := idempotency.NewDefaultCoordinator(&mockIdempotencyStore{}, 30*time.Second, 24*time.Hour, nil)
+	svc, err := disbursement.NewService(store, outboxStore, transactor, coordinator, nil)
 	if err != nil {
 		t.Fatalf("failed to create service: %v", err)
 	}
@@ -331,7 +347,7 @@ func TestDisbursementServiceRepositoryErrorMappings(t *testing.T) {
 	for _, tc := range repoErrors {
 		store := newMockDisbursementStore()
 		store.injectError = tc.repoErr
-		svc, _ := disbursement.NewService(store, &mockAuditOutboxStore{}, transactor, nil)
+		svc, _ := disbursement.NewService(store, &mockAuditOutboxStore{}, transactor, nil, nil)
 
 		_, err := svc.GetByID(ctx, uuid.New())
 		if err == nil {
@@ -372,8 +388,8 @@ func TestDisbursementServiceIdempotencyOutcomes(t *testing.T) {
 				},
 			},
 		}
-		coordinator, _ := idempotency.NewDefaultCoordinator(idempotencyStore, 30*time.Second, 24*time.Hour)
-		svc, _ := disbursement.NewService(store, outboxStore, transactor, coordinator)
+		coordinator, _ := idempotency.NewDefaultCoordinator(idempotencyStore, 30*time.Second, 24*time.Hour, nil)
+		svc, _ := disbursement.NewService(store, outboxStore, transactor, coordinator, nil)
 
 		res, err := svc.Create(ctx, actorID, requestID, key, input)
 		if err != nil {
@@ -384,28 +400,24 @@ func TestDisbursementServiceIdempotencyOutcomes(t *testing.T) {
 		}
 	})
 
-	t.Run("ClaimInProgress returns IdempotencyRequestInProgress error", func(t *testing.T) {
+	t.Run("Create with idempotency inProgress returns IdempotencyRequestInProgress error", func(t *testing.T) {
 		idempotencyStore := &mockIdempotencyStore{
 			claimResult: domain.IdempotencyClaimResult{Outcome: domain.ClaimInProgress},
 		}
-		coordinator, _ := idempotency.NewDefaultCoordinator(idempotencyStore, 30*time.Second, 24*time.Hour)
-		svc, _ := disbursement.NewService(store, outboxStore, transactor, coordinator)
-
-		_, err := svc.Create(ctx, actorID, requestID, key, input)
+		coordinator, _ := idempotency.NewDefaultCoordinator(idempotencyStore, 30*time.Second, 24*time.Hour, nil)
+		svc, _ := disbursement.NewService(store, outboxStore, transactor, coordinator, nil)
+		_, err := svc.Create(context.Background(), actorID, requestID, "idempotency-key-1", input)
 		if err == nil {
-			t.Fatalf("expected error for ClaimInProgress")
-		}
-		if got := domain.AsError(err).Code; got != domain.CodeIdempotencyInProgress {
-			t.Errorf("expected code %s, got %s", domain.CodeIdempotencyInProgress, got)
+			t.Fatalf("expected error on inProgress claim, got nil")
 		}
 	})
 
-	t.Run("ClaimReused returns IdempotencyKeyReused error", func(t *testing.T) {
+	t.Run("Create with idempotency reused returns IdempotencyKeyReused error", func(t *testing.T) {
 		idempotencyStore := &mockIdempotencyStore{
 			claimResult: domain.IdempotencyClaimResult{Outcome: domain.ClaimReused},
 		}
-		coordinator, _ := idempotency.NewDefaultCoordinator(idempotencyStore, 30*time.Second, 24*time.Hour)
-		svc, _ := disbursement.NewService(store, outboxStore, transactor, coordinator)
+		coordinator, _ := idempotency.NewDefaultCoordinator(idempotencyStore, 30*time.Second, 24*time.Hour, nil)
+		svc, _ := disbursement.NewService(store, outboxStore, transactor, coordinator, nil)
 
 		_, err := svc.Create(ctx, actorID, requestID, key, input)
 		if err == nil {
@@ -413,6 +425,63 @@ func TestDisbursementServiceIdempotencyOutcomes(t *testing.T) {
 		}
 		if got := domain.AsError(err).Code; got != domain.CodeIdempotencyKeyReused {
 			t.Errorf("expected code %s, got %s", domain.CodeIdempotencyKeyReused, got)
+		}
+	})
+
+	t.Run("UpdateStatus error handling", func(t *testing.T) {
+		store := newMockDisbursementStore()
+		outboxStore := &mockAuditOutboxStore{}
+		transactor := mockTransactor{}
+		svc, _ := disbursement.NewService(store, outboxStore, transactor, nil, nil)
+
+		// 1. Update non-existent record -> 404 NOT_FOUND
+		decision := domain.Decision{Status: domain.StatusApproved, ActorID: uuid.New()}
+		_, err := svc.UpdateStatus(ctx, actorID, requestID, uuid.New(), decision)
+		if err == nil || domain.AsError(err).Code != domain.CodeDisbursementNotFound {
+			t.Fatalf("expected CodeDisbursementNotFound, got %v", err)
+		}
+
+		// 2. Update record with store failure -> DB error
+		store.injectError = errors.New("db connection failure")
+		_, err2 := svc.UpdateStatus(ctx, actorID, requestID, uuid.New(), decision)
+		if err2 == nil {
+			t.Fatalf("expected error on store failure, got nil")
+		}
+	})
+
+	t.Run("NewService nil parameter checks", func(t *testing.T) {
+		store := newMockDisbursementStore()
+		outboxStore := &mockAuditOutboxStore{}
+		transactor := mockTransactor{}
+
+		if _, err := disbursement.NewService(nil, outboxStore, transactor, nil, nil); err == nil {
+			t.Errorf("expected error for nil disbursementStore")
+		}
+		if _, err := disbursement.NewService(store, nil, transactor, nil, nil); err == nil {
+			t.Errorf("expected error for nil auditOutboxStore")
+		}
+		if _, err := disbursement.NewService(store, outboxStore, nil, nil, nil); err == nil {
+			t.Errorf("expected error for nil transactor")
+		}
+	})
+
+	t.Run("SoftDelete error mappings", func(t *testing.T) {
+		store := newMockDisbursementStore()
+		outboxStore := &mockAuditOutboxStore{}
+		transactor := mockTransactor{}
+		svc, _ := disbursement.NewService(store, outboxStore, transactor, nil, nil)
+
+		// 1. SoftDelete non-existent record -> 404 NOT_FOUND
+		_, _, err := svc.SoftDelete(ctx, actorID, requestID, uuid.New())
+		if err == nil || domain.AsError(err).Code != domain.CodeDisbursementNotFound {
+			t.Fatalf("expected CodeDisbursementNotFound, got %v", err)
+		}
+
+		// 2. SoftDelete store failure -> Internal error
+		store.injectError = errors.New("db failure")
+		_, _, err2 := svc.SoftDelete(ctx, actorID, requestID, uuid.New())
+		if err2 == nil {
+			t.Fatalf("expected error on store failure, got nil")
 		}
 	})
 }

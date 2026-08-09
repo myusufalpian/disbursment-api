@@ -8,6 +8,7 @@ import (
 
 	"disbursment-api/internal/domain"
 	"disbursment-api/internal/httpapi/dto"
+	"disbursment-api/internal/observability/metrics"
 	"disbursment-api/internal/repository"
 	"disbursment-api/internal/service/idempotency"
 
@@ -25,6 +26,7 @@ type Service struct {
 	auditOutboxStore  repository.AuditOutboxStore
 	transactor        repository.Transactor
 	coordinator       *idempotency.Coordinator
+	metrics           *metrics.MetricsCollector
 }
 
 func NewService(
@@ -32,6 +34,7 @@ func NewService(
 	auditOutboxStore repository.AuditOutboxStore,
 	transactor repository.Transactor,
 	coordinator *idempotency.Coordinator,
+	metricsCollector *metrics.MetricsCollector,
 ) (*Service, error) {
 	if disbursementStore == nil || auditOutboxStore == nil || transactor == nil {
 		return nil, fmt.Errorf("invalid disbursement service dependencies")
@@ -41,6 +44,7 @@ func NewService(
 		auditOutboxStore:  auditOutboxStore,
 		transactor:        transactor,
 		coordinator:       coordinator,
+		metrics:           metricsCollector,
 	}, nil
 }
 
@@ -272,7 +276,19 @@ func (s *Service) UpdateStatus(
 	})
 
 	if err != nil {
-		return domain.Disbursement{}, s.mapRepositoryError(err)
+		mappedErr := s.mapRepositoryError(err)
+		if domainErr, ok := mappedErr.(*domain.Error); ok && domainErr.Code == domain.CodeConcurrentModification && s.metrics != nil {
+			s.metrics.RecordFinalizationOutcome("conflict")
+		}
+		return domain.Disbursement{}, mappedErr
+	}
+
+	if s.metrics != nil {
+		if decision.Status == domain.StatusApproved {
+			s.metrics.RecordFinalizationOutcome("approved")
+		} else if decision.Status == domain.StatusRejected {
+			s.metrics.RecordFinalizationOutcome("rejected")
+		}
 	}
 
 	return updated, nil

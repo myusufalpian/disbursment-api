@@ -15,6 +15,7 @@ import (
 	"disbursment-api/internal/httpapi"
 	"disbursment-api/internal/httpapi/dto"
 	"disbursment-api/internal/httpapi/validation"
+	"disbursment-api/internal/observability/metrics"
 	"disbursment-api/internal/repository"
 	"disbursment-api/internal/service/auth"
 
@@ -121,7 +122,7 @@ func TestAuthHTTPIntegration(t *testing.T) {
 	userStore.users[user.Username] = user
 	userStore.byID[user.ID] = user
 
-	authService := auth.NewService(userStore, sessionStore, transactor, "test-secret-key-12345", 15*time.Minute, 7*24*time.Hour)
+	authService := auth.NewService(userStore, sessionStore, transactor, "test-secret-key-12345", 15*time.Minute, 7*24*time.Hour, nil)
 	validatorEngine, err := validation.New()
 	if err != nil {
 		t.Fatalf("validator init failed: %v", err)
@@ -129,7 +130,11 @@ func TestAuthHTTPIntegration(t *testing.T) {
 
 	authHandler := httpapi.NewAuthHandler(authService, validatorEngine)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	router := httpapi.NewRouter(1<<20, logger, "test-secret-key-12345", authHandler, nil)
+	metricsCollector := metrics.NewMetricsCollector()
+	router, err := httpapi.NewRouter(1<<20, logger, "test-secret-key-12345", "disbursement-api", "disbursement-api-users", authHandler, nil, metricsCollector, "test-metrics-token", nil)
+	if err != nil {
+		t.Fatalf("router init failed: %v", err)
+	}
 
 	var refreshToken string
 
@@ -248,6 +253,66 @@ func TestAuthHTTPIntegration(t *testing.T) {
 
 		if w2.Code != http.StatusNoContent {
 			t.Fatalf("expected status 204 on repeated logout, got %d: %s", w2.Code, w2.Body.String())
+		}
+	})
+
+	t.Run("POST /auth/login - malformed JSON and validation failure", func(t *testing.T) {
+		// 1. Malformed JSON
+		req1, _ := http.NewRequest(http.MethodPost, "/auth/login", bytes.NewReader([]byte(`{invalid-json`)))
+		req1.Header.Set("Content-Type", "application/json")
+		w1 := httptest.NewRecorder()
+		router.ServeHTTP(w1, req1)
+		if w1.Code != http.StatusBadRequest {
+			t.Errorf("expected 400 Bad Request for malformed JSON, got %d", w1.Code)
+		}
+
+		// 2. Validation failure (empty username)
+		body, _ := json.Marshal(dto.LoginRequest{Username: "", Password: "password123"})
+		req2, _ := http.NewRequest(http.MethodPost, "/auth/login", bytes.NewReader(body))
+		req2.Header.Set("Content-Type", "application/json")
+		w2 := httptest.NewRecorder()
+		router.ServeHTTP(w2, req2)
+		if w2.Code != http.StatusBadRequest {
+			t.Errorf("expected 400 Bad Request for empty username, got %d", w2.Code)
+		}
+	})
+
+	t.Run("POST /auth/refresh - malformed JSON and validation failure", func(t *testing.T) {
+		req1, _ := http.NewRequest(http.MethodPost, "/auth/refresh", bytes.NewReader([]byte(`{invalid-json`)))
+		req1.Header.Set("Content-Type", "application/json")
+		w1 := httptest.NewRecorder()
+		router.ServeHTTP(w1, req1)
+		if w1.Code != http.StatusBadRequest {
+			t.Errorf("expected 400 Bad Request, got %d", w1.Code)
+		}
+	})
+
+	t.Run("POST /auth/logout - malformed JSON and validation failure", func(t *testing.T) {
+		req1, _ := http.NewRequest(http.MethodPost, "/auth/logout", bytes.NewReader([]byte(`{invalid-json`)))
+		req1.Header.Set("Content-Type", "application/json")
+		w1 := httptest.NewRecorder()
+		router.ServeHTTP(w1, req1)
+		if w1.Code != http.StatusBadRequest {
+			t.Errorf("expected 400 Bad Request, got %d", w1.Code)
+		}
+	})
+
+	t.Run("GET /metrics - authentication token check", func(t *testing.T) {
+		// 1. Missing token header returns 401
+		req1, _ := http.NewRequest(http.MethodGet, "/metrics", nil)
+		w1 := httptest.NewRecorder()
+		router.ServeHTTP(w1, req1)
+		if w1.Code != http.StatusUnauthorized {
+			t.Errorf("expected 401 Unauthorized for metrics without header, got %d", w1.Code)
+		}
+
+		// 2. Valid token header returns 200 OK
+		req2, _ := http.NewRequest(http.MethodGet, "/metrics", nil)
+		req2.Header.Set("X-Metrics-Token", "test-metrics-token")
+		w2 := httptest.NewRecorder()
+		router.ServeHTTP(w2, req2)
+		if w2.Code != http.StatusOK {
+			t.Errorf("expected 200 OK for metrics with valid token, got %d", w2.Code)
 		}
 	})
 }

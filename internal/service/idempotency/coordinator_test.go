@@ -118,7 +118,7 @@ func TestNewCoordinatorRejectsInvalidConfiguration(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			coordinator, err := NewCoordinator(test.store, test.clock, test.generator, test.leaseTTL, test.replayTTL)
+			coordinator, err := NewCoordinator(test.store, test.clock, test.generator, test.leaseTTL, test.replayTTL, nil)
 			if err == nil {
 				t.Fatal("NewCoordinator() error = nil, want an error")
 			}
@@ -136,7 +136,7 @@ func TestNewCoordinatorAcceptsValidDependenciesAndTTLs(t *testing.T) {
 	leaseTTL := 30 * time.Second
 	replayTTL := 24 * time.Hour
 
-	coordinator, err := NewCoordinator(store, clock, generator, leaseTTL, replayTTL)
+	coordinator, err := NewCoordinator(store, clock, generator, leaseTTL, replayTTL, nil)
 
 	if err != nil {
 		t.Fatalf("NewCoordinator() error = %v", err)
@@ -430,7 +430,7 @@ func newTestCoordinator(store *fakeIdempotencyStore, generator UUIDGenerator) *C
 }
 
 func newTestCoordinatorWithClock(store *fakeIdempotencyStore, clock Clock, generator UUIDGenerator) *Coordinator {
-	coordinator, err := NewCoordinator(store, clock, generator, 30*time.Second, 24*time.Hour)
+	coordinator, err := NewCoordinator(store, clock, generator, 30*time.Second, 24*time.Hour, nil)
 	if err != nil {
 		panic(err)
 	}
