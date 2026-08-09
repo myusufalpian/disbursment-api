@@ -95,9 +95,10 @@ func TestMiddleware_RBAC_BodyLimit_And_Auth(t *testing.T) {
 
 		// Valid token -> 200
 		token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-			"sub":  "11111111-1111-1111-1111-111111111111",
-			"role": string(domain.RoleAdmin),
-			"exp":  time.Now().Add(time.Hour).Unix(),
+			"sub":      "11111111-1111-1111-1111-111111111111",
+			"username": "testadmin",
+			"role":     string(domain.RoleAdmin),
+			"exp":      time.Now().Add(time.Hour).Unix(),
 		})
 		signed, _ := token.SignedString([]byte(secret))
 

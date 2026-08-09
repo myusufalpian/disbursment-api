@@ -20,6 +20,11 @@ func TestIdempotencyStore_AcquireAndComplete(t *testing.T) {
 		t.Fatalf("failed to open sqlmock: %v", err)
 	}
 	defer db.Close()
+	t.Cleanup(func() {
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("sqlmock expectations: %v", err)
+		}
+	})
 
 	sqlxDB := sqlx.NewDb(db, "sqlmock")
 	store := NewIdempotencyStore(sqlxDB)
@@ -64,7 +69,7 @@ func TestIdempotencyStore_AcquireAndComplete(t *testing.T) {
 			WithArgs(userID, endpoint, key).
 			WillReturnRows(rows)
 
-		tx, _ := sqlxDB.BeginTxx(context.Background(), nil)
+		tx := beginSQLMockTx(t, mock, sqlxDB)
 		scope := domain.IdempotencyScope{UserID: userID, Endpoint: endpoint, Key: key}
 
 		err := store.VerifyOwnership(context.Background(), newTestTx(tx), scope, claimID)
@@ -74,17 +79,21 @@ func TestIdempotencyStore_AcquireAndComplete(t *testing.T) {
 	})
 
 	t.Run("Complete claim success", func(t *testing.T) {
+		responseID := uuid.New()
+		responseBody := []byte(`{"status":"PENDING"}`)
+		completionTime := now
+
 		mock.ExpectBegin()
 		mock.ExpectExec("^UPDATE idempotency_keys SET state = 'COMPLETED'").
-			WithArgs(sqlmock.AnyArg(), 201, sqlmock.AnyArg(), sqlmock.AnyArg(), userID, endpoint, key, claimID).
+			WithArgs(responseID, 201, responseBody, completionTime, userID, endpoint, key, claimID).
 			WillReturnResult(sqlmock.NewResult(1, 1))
 
-		tx, _ := sqlxDB.BeginTxx(context.Background(), nil)
+		tx := beginSQLMockTx(t, mock, sqlxDB)
 		completion := domain.IdempotencyCompletion{
 			Scope:       domain.IdempotencyScope{UserID: userID, Endpoint: endpoint, Key: key},
 			ClaimID:     claimID,
-			Response:    domain.ReplayResponse{StatusCode: 201, Body: []byte(`{"status":"PENDING"}`), DisbursementID: uuid.New()},
-			CompletedAt: now,
+			Response:    domain.ReplayResponse{StatusCode: 201, Body: responseBody, DisbursementID: responseID},
+			CompletedAt: completionTime,
 		}
 
 		err := store.Complete(context.Background(), newTestTx(tx), completion)

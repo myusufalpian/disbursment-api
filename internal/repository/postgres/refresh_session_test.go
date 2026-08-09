@@ -19,6 +19,11 @@ func TestRefreshSessionStore(t *testing.T) {
 		t.Fatalf("failed to open sqlmock: %v", err)
 	}
 	defer db.Close()
+	t.Cleanup(func() {
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("sqlmock expectations: %v", err)
+		}
+	})
 
 	sqlxDB := sqlx.NewDb(db, "postgres")
 	store := NewRefreshSessionStore(sqlxDB)
@@ -42,7 +47,7 @@ func TestRefreshSessionStore(t *testing.T) {
 			WithArgs(session.ID, session.UserID, session.TokenHash, session.ExpiresAt).
 			WillReturnResult(sqlmock.NewResult(1, 1))
 
-		tx, _ := sqlxDB.BeginTxx(context.Background(), nil)
+		tx := beginSQLMockTx(t, mock, sqlxDB)
 		err := store.Create(context.Background(), newTestTx(tx), session)
 		if err != nil {
 			t.Fatalf("Create failed: %v", err)
@@ -81,22 +86,23 @@ func TestRefreshSessionStore(t *testing.T) {
 	})
 
 	t.Run("Rotate refresh token success", func(t *testing.T) {
-		mock.ExpectBegin()
-		mock.ExpectExec("^INSERT INTO refresh_sessions").
-			WithArgs(sqlmock.AnyArg(), session.UserID, newTokenHash, session.ExpiresAt, now).
-			WillReturnResult(sqlmock.NewResult(1, 1))
-
-		mock.ExpectExec("^UPDATE refresh_sessions SET revoked_at = \\$1").
-			WithArgs(now, sqlmock.AnyArg(), tokenHash).
-			WillReturnResult(sqlmock.NewResult(1, 1))
-
-		tx, _ := sqlxDB.BeginTxx(context.Background(), nil)
 		newSession := repository.RefreshSession{
 			ID:        uuid.New(),
 			UserID:    userID,
 			TokenHash: newTokenHash,
 			ExpiresAt: expiresAt,
 		}
+
+		mock.ExpectBegin()
+		mock.ExpectExec("^INSERT INTO refresh_sessions").
+			WithArgs(newSession.ID, session.UserID, newTokenHash, session.ExpiresAt, now).
+			WillReturnResult(sqlmock.NewResult(1, 1))
+
+		mock.ExpectExec("^UPDATE refresh_sessions SET revoked_at = \\$1").
+			WithArgs(now, newSession.ID, tokenHash).
+			WillReturnResult(sqlmock.NewResult(1, 1))
+
+		tx := beginSQLMockTx(t, mock, sqlxDB)
 
 		err := store.Rotate(context.Background(), newTestTx(tx), tokenHash, newSession, now)
 		if err != nil {
@@ -110,7 +116,7 @@ func TestRefreshSessionStore(t *testing.T) {
 			WithArgs(now, tokenHash).
 			WillReturnResult(sqlmock.NewResult(1, 1))
 
-		tx, _ := sqlxDB.BeginTxx(context.Background(), nil)
+		tx := beginSQLMockTx(t, mock, sqlxDB)
 		err := store.RevokeByTokenHash(context.Background(), newTestTx(tx), tokenHash, now)
 		if err != nil {
 			t.Fatalf("RevokeByTokenHash failed: %v", err)

@@ -78,10 +78,14 @@ type dbDisbursement struct {
 
 type DisbursementStore struct {
 	database *sqlx.DB
+	now      func() time.Time
 }
 
 func NewDisbursementStore(database *sqlx.DB) *DisbursementStore {
-	return &DisbursementStore{database: database}
+	return &DisbursementStore{
+		database: database,
+		now:      func() time.Time { return time.Now().UTC() },
+	}
 }
 
 func (store *DisbursementStore) Insert(ctx context.Context, transaction repository.Transaction, d domain.Disbursement) error {
@@ -241,7 +245,7 @@ func (store *DisbursementStore) UpdateStatus(ctx context.Context, transaction re
 		return domain.Disbursement{}, err
 	}
 
-	now := time.Now().UTC()
+	now := store.now()
 	var decisionNote *string
 	if decision.Note != "" {
 		decisionNote = &decision.Note
@@ -284,7 +288,7 @@ func (store *DisbursementStore) SoftDelete(ctx context.Context, transaction repo
 		return domain.Disbursement{}, false, err
 	}
 
-	now := time.Now().UTC()
+	now := store.now()
 	var deleted dbDisbursement
 	err = tx.GetContext(ctx, &deleted, softDeleteDisbursementQuery, now, id)
 	if err == nil {

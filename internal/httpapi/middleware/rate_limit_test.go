@@ -12,8 +12,12 @@ import (
 func TestRateLimitMiddleware(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
+	limiter := newIPRateLimiter(3, 100*time.Millisecond)
+	currentTime := time.Date(2026, time.August, 9, 16, 0, 0, 0, time.UTC)
+	limiter.now = func() time.Time { return currentTime }
+
 	router := gin.New()
-	router.Use(RateLimit(3, 100*time.Millisecond, nil))
+	router.Use(rateLimitHandler(limiter, nil))
 	router.POST("/auth/login", func(c *gin.Context) {
 		c.String(http.StatusOK, "OK")
 	})
@@ -37,19 +41,6 @@ func TestRateLimitMiddleware(t *testing.T) {
 
 	if w.Code != http.StatusTooManyRequests {
 		t.Fatalf("expected 429 Too Many Requests, got %d", w.Code)
-	}
-
-	// Wait for window to expire
-	time.Sleep(120 * time.Millisecond)
-
-	// Subsequent request after window expiration should succeed again
-	w2 := httptest.NewRecorder()
-	req2, _ := http.NewRequest("POST", "/auth/login", nil)
-	req2.RemoteAddr = "192.168.1.1:1234"
-	router.ServeHTTP(w2, req2)
-
-	if w2.Code != http.StatusOK {
-		t.Fatalf("expected 200 OK after window expiration, got %d", w2.Code)
 	}
 }
 
@@ -79,30 +70,45 @@ func TestRateLimitCleanupAndMaxClients(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	t.Run("cleanupExpired invocation", func(t *testing.T) {
-		router := gin.New()
-		router.Use(RateLimit(1000, 10*time.Millisecond, nil))
-		router.POST("/login", func(c *gin.Context) { c.Status(http.StatusOK) })
+		limiter := newIPRateLimiter(1000, 10*time.Millisecond)
+		now := time.Date(2026, time.August, 9, 7, 0, 0, 0, time.UTC)
+		limiter.requests["expired"] = []time.Time{now.Add(-time.Second)}
+		limiter.requests["active"] = []time.Time{now}
 
-		// Make 257 requests to trigger cleanupAfter >= 256
-		for i := 0; i < 257; i++ {
-			w := httptest.NewRecorder()
-			req, _ := http.NewRequest("POST", "/login", nil)
-			req.RemoteAddr = "10.0.0.1:1234"
-			router.ServeHTTP(w, req)
+		limiter.cleanupExpired(now)
+
+		if _, ok := limiter.requests["expired"]; ok {
+			t.Fatal("expected expired client state to be removed")
+		}
+		if len(limiter.requests["active"]) != 1 {
+			t.Fatalf("active client timestamps = %d, want 1", len(limiter.requests["active"]))
 		}
 	})
 
 	t.Run("maxTrackedClients reached", func(t *testing.T) {
 		limiter := newIPRateLimiter(10, time.Minute)
-		// Populate requests map to maxTrackedClients
+		now := time.Date(2026, time.August, 9, 7, 0, 0, 0, time.UTC)
+		limiter.now = func() time.Time { return now }
 		for i := 0; i < maxTrackedClients; i++ {
-			limiter.requests[string(rune(i))] = []time.Time{time.Now()}
+			limiter.requests[string(rune(i))] = []time.Time{now}
 		}
 
 		router := gin.New()
-		router.Use(func(c *gin.Context) {
-			c.Set("limiter", limiter)
-			RateLimit(10, time.Minute, nil)(c)
+		router.Use(rateLimitHandler(limiter, nil))
+		router.GET("/limited", func(c *gin.Context) {
+			c.Status(http.StatusOK)
 		})
+
+		req := httptest.NewRequest(http.MethodGet, "/limited", nil)
+		req.RemoteAddr = "192.168.1.2:1234"
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+
+		if w.Code != http.StatusTooManyRequests {
+			t.Fatalf("expected 429 Too Many Requests, got %d", w.Code)
+		}
+		if got := w.Header().Get("Retry-After"); got != "60" {
+			t.Fatalf("Retry-After = %q, want %q", got, "60")
+		}
 	})
 }

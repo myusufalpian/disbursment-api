@@ -18,6 +18,7 @@ type ipRateLimiter struct {
 	limit        int
 	window       time.Duration
 	cleanupAfter uint64
+	now          func() time.Time
 }
 
 const maxTrackedClients = 10_000
@@ -33,14 +34,17 @@ func newIPRateLimiter(limit int, window time.Duration) *ipRateLimiter {
 		requests: make(map[string][]time.Time),
 		limit:    limit,
 		window:   window,
+		now:      time.Now,
 	}
 
 	return limiter
 }
 
 func RateLimit(limit int, window time.Duration, collector *metrics.MetricsCollector) gin.HandlerFunc {
-	limiter := newIPRateLimiter(limit, window)
+	return rateLimitHandler(newIPRateLimiter(limit, window), collector)
+}
 
+func rateLimitHandler(limiter *ipRateLimiter, collector *metrics.MetricsCollector) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		clientIP := c.ClientIP()
 		if clientIP == "" {
@@ -48,7 +52,7 @@ func RateLimit(limit int, window time.Duration, collector *metrics.MetricsCollec
 		}
 
 		limiter.mu.Lock()
-		now := time.Now()
+		now := limiter.now()
 		limiter.cleanupAfter++
 		if limiter.cleanupAfter >= 256 {
 			limiter.cleanupExpired(now)
@@ -58,7 +62,7 @@ func RateLimit(limit int, window time.Duration, collector *metrics.MetricsCollec
 		times := limiter.requests[clientIP]
 		var valid []time.Time
 		for _, t := range times {
-			if now.Sub(t) <= window {
+			if now.Sub(t) <= limiter.window {
 				valid = append(valid, t)
 			}
 		}

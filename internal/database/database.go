@@ -21,9 +21,8 @@ func Open(ctx context.Context, config config.DatabaseConfig) (*sqlx.DB, error) {
 	database.SetConnMaxLifetime(config.ConnectionMaxLifetime)
 
 	if err := database.PingContext(ctx); err != nil {
-		err := database.Close()
-		if err != nil {
-			return nil, err
+		if closeErr := database.Close(); closeErr != nil {
+			return nil, fmt.Errorf("ping database: %w (close error: %v)", err, closeErr)
 		}
 		return nil, fmt.Errorf("ping database: %w", err)
 	}

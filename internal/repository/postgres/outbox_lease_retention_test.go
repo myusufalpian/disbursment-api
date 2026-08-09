@@ -18,9 +18,16 @@ func TestAuditOutboxStore_LeaseAndRetentionBehavior(t *testing.T) {
 		t.Fatalf("failed to open sqlmock: %v", err)
 	}
 	defer db.Close()
+	t.Cleanup(func() {
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("sqlmock expectations: %v", err)
+		}
+	})
 	sqlxDB := sqlx.NewDb(db, "sqlmock")
 
 	store := NewAuditOutboxStoreWithLease(sqlxDB, 2*time.Minute)
+	now := time.Date(2026, time.August, 9, 13, 0, 0, 0, time.UTC)
+	store.now = func() time.Time { return now }
 
 	eventID := uuid.New()
 	event := domain.AuditEvent{
@@ -32,7 +39,7 @@ func TestAuditOutboxStore_LeaseAndRetentionBehavior(t *testing.T) {
 		RequestID:  uuid.New(),
 		BeforeData: []byte(`{}`),
 		AfterData:  []byte(`{"status":"PENDING"}`),
-		OccurredAt: time.Now().UTC(),
+		OccurredAt: now,
 	}
 
 	t.Run("Worker A claims batch with 2m lease duration", func(t *testing.T) {
@@ -40,7 +47,7 @@ func TestAuditOutboxStore_LeaseAndRetentionBehavior(t *testing.T) {
 			AddRow(event.EventID, event.EntityType, event.EntityID, event.Action, event.ActorID, event.RequestID, event.BeforeData, event.AfterData, event.OccurredAt)
 
 		mock.ExpectQuery("^UPDATE audit_outbox SET available_at =").
-			WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), 10).
+			WithArgs(now.Add(2*time.Minute), now, 10).
 			WillReturnRows(rows)
 
 		fetched, err := store.FetchPending(context.Background(), 10)
@@ -56,7 +63,7 @@ func TestAuditOutboxStore_LeaseAndRetentionBehavior(t *testing.T) {
 		rows := sqlmock.NewRows([]string{"event_id", "entity_type", "entity_id", "action", "actor_id", "request_id", "before_data", "after_data", "occurred_at"})
 
 		mock.ExpectQuery("^UPDATE audit_outbox SET available_at =").
-			WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), 10).
+			WithArgs(now.Add(2*time.Minute), now, 10).
 			WillReturnRows(rows)
 
 		fetched, err := store.FetchPending(context.Background(), 10)
@@ -73,7 +80,7 @@ func TestAuditOutboxStore_LeaseAndRetentionBehavior(t *testing.T) {
 			AddRow(event.EventID, event.EntityType, event.EntityID, event.Action, event.ActorID, event.RequestID, event.BeforeData, event.AfterData, event.OccurredAt)
 
 		mock.ExpectQuery("^UPDATE audit_outbox SET available_at =").
-			WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), 10).
+			WithArgs(now.Add(2*time.Minute), now, 10).
 			WillReturnRows(reclaimedRows)
 
 		fetched, err := store.FetchPending(context.Background(), 10)
@@ -87,7 +94,7 @@ func TestAuditOutboxStore_LeaseAndRetentionBehavior(t *testing.T) {
 
 	t.Run("CleanupDelivered prunes delivered outbox entries older than retention window", func(t *testing.T) {
 		mock.ExpectExec("^DELETE FROM audit_outbox WHERE delivery_state = 'DELIVERED' AND delivered_at <").
-			WithArgs(sqlmock.AnyArg()).
+			WithArgs(now.Add(-30 * 24 * time.Hour)).
 			WillReturnResult(sqlmock.NewResult(0, 15))
 
 		cleaned, err := store.CleanupDelivered(context.Background(), 30*24*time.Hour)

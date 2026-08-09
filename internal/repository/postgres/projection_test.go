@@ -19,6 +19,11 @@ func TestAuditProjectionStore_InsertProjection(t *testing.T) {
 		t.Fatalf("failed to open sqlmock: %v", err)
 	}
 	defer db.Close()
+	t.Cleanup(func() {
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("sqlmock expectations: %v", err)
+		}
+	})
 
 	sqlxDB := sqlx.NewDb(db, "sqlmock")
 	store := NewAuditProjectionStore(sqlxDB)
@@ -37,7 +42,7 @@ func TestAuditProjectionStore_InsertProjection(t *testing.T) {
 
 	t.Run("Insert projection with direct DB connection", func(t *testing.T) {
 		mock.ExpectExec("^INSERT INTO audit_logs").
-			WithArgs(event.EventID, event.EntityType, event.EntityID, event.Action, event.ActorID, event.RequestID, event.BeforeData, event.AfterData, event.OccurredAt).
+			WithArgs(event.EventID, event.EntityType, event.EntityID, event.Action, event.ActorID, event.RequestID, string(event.BeforeData), string(event.AfterData), event.OccurredAt).
 			WillReturnResult(sqlmock.NewResult(1, 1))
 
 		err := store.InsertProjection(context.Background(), nil, event)
@@ -49,10 +54,10 @@ func TestAuditProjectionStore_InsertProjection(t *testing.T) {
 	t.Run("Insert projection with transaction", func(t *testing.T) {
 		mock.ExpectBegin()
 		mock.ExpectExec("^INSERT INTO audit_logs").
-			WithArgs(event.EventID, event.EntityType, event.EntityID, event.Action, event.ActorID, event.RequestID, event.BeforeData, event.AfterData, event.OccurredAt).
+			WithArgs(event.EventID, event.EntityType, event.EntityID, event.Action, event.ActorID, event.RequestID, string(event.BeforeData), string(event.AfterData), event.OccurredAt).
 			WillReturnResult(sqlmock.NewResult(1, 1))
 
-		tx, _ := sqlxDB.BeginTxx(context.Background(), nil)
+		tx := beginSQLMockTx(t, mock, sqlxDB)
 		err := store.InsertProjection(context.Background(), newTestTx(tx), event)
 		if err != nil {
 			t.Fatalf("InsertProjection with tx failed: %v", err)

@@ -58,6 +58,11 @@ Detailed architectural decision records and system design choices are documented
 - **Idempotent Soft Delete:** `DELETE /disbursements/:id` performs soft deletion (`deleted_at = now()`) for `SUPERADMIN` role on `PENDING` resources, returning `204 No Content` idempotently on repeat calls without duplicate outbox writes.
 - **Transactional Outbox Consistency:** All mutations write immutable audit events into `audit_outbox` within the caller's database transaction. Any outbox insert failure triggers a complete rollback of the business mutation (*zero audit data loss*).
 
+### 5. Integration Release Gates & Contract Verification (`internal/integration` & `internal/httpapi`)
+- **PostgreSQL Release Gate Harness (`internal/integration/postgres_release_gate_test.go`):** Validates full schema migration roll-up/tear-down (`UpDownUp`), single-winner idempotency claim acquisition under parallel goroutines, single disbursement creation & outbox event insertion under N-way concurrent requests, atomic finalization status locking, and atomic refresh token rotation on real PostgreSQL.
+- **Strict Environment Safety:** Release-gate integration tests enforce loopback host targets (`localhost`/`127.0.0.1`), dedicated database names (`disbursement_api_release_gate_test`), and fresh public schema safety validation (`assertFreshReleaseGateDatabase`) to prevent accidental execution against non-test databases.
+- **HTTP Release Contract Suite (`internal/httpapi/release_contract_test.go`):** Enforces standardized JSON error response formatting, `X-Request-ID` propagation, 204 No Content for bodyless responses (`logout`, `delete`), `X-Idempotent-Replayed: true` headers, and `Retry-After` headers for in-progress claims.
+
 ---
 
 ## Database Schema
@@ -183,7 +188,7 @@ CREATE TABLE audit_outbox (
 Set mandatory environment variables:
 
 ```bash
-export DATABASE_URL="postgres://postgres:postgres@localhost:5432/disbursement_db?sslmode=disable"
+export DATABASE_URL="postgres://<user>:<password>@localhost:5432/disbursement_db?sslmode=disable"
 export JWT_SECRET="super-secret-key-minimum-32-characters"
 export HTTP_ADDRESS=":8080"
 ```
@@ -214,6 +219,7 @@ export HTTP_ADDRESS=":8080"
 | `AUDIT_OUTBOX_BATCH_SIZE` | No | `100` | Number of outbox events claimed per relay cycle |
 | `AUDIT_RELAY_INTERVAL` | No | `5s` | Audit relay worker polling interval |
 | `AUDIT_RETENTION_DAYS` | No | `30` | Days before delivered outbox staging records are pruned |
+| `POSTGRES_RELEASE_GATE` | No | `0` | Set to `1` to authorize local PostgreSQL release gate integration tests |
 
 ---
 
@@ -243,13 +249,18 @@ go run ./cmd/api
 
 ### 4. Running the Test Suite
 
-Execute the deterministic unit test suite with race detection:
+Execute the deterministic unit test suite and PostgreSQL integration release gate:
 
 ```bash
-# Run all unit tests with race detector
+# 1. Run all unit & release contract tests with race detector
 go test -v -race ./...
 
-# Run with coverage profile
+# 2. Run PostgreSQL Release Gate Integration Tests (requires POSTGRES_RELEASE_GATE=1)
+POSTGRES_RELEASE_GATE=1 \
+DATABASE_URL="postgres://<user>:<password>@localhost:5432/disbursement_api_release_gate_test?sslmode=disable" \
+go test -v -run TestPostgreSQLReleaseGate ./internal/integration/...
+
+# 3. Run with coverage profile
 go test -v -race -coverprofile=coverage.out ./...
 go tool cover -func=coverage.out
 ```
@@ -262,7 +273,7 @@ docker build -t disbursement-api:latest .
 
 # Run container
 docker run -p 8080:8080 \
-  -e DATABASE_URL="postgres://postgres:postgres@host.docker.internal:5432/disbursement_db?sslmode=disable" \
+  -e DATABASE_URL="postgres://<user>:<password>@host.docker.internal:5432/disbursement_db?sslmode=disable" \
   -e JWT_SECRET="your-secret-key-minimum-32-characters" \
   -e JWT_ISSUER="disbursement-api" \
   -e JWT_AUDIENCE="disbursement-api-users" \

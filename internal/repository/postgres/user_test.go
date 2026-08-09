@@ -19,6 +19,11 @@ func TestUserStore_FindByUsernameAndID(t *testing.T) {
 		t.Fatalf("failed to open sqlmock: %v", err)
 	}
 	defer db.Close()
+	t.Cleanup(func() {
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("sqlmock expectations: %v", err)
+		}
+	})
 
 	sqlxDB := sqlx.NewDb(db, "postgres")
 	store := NewUserStore(sqlxDB)

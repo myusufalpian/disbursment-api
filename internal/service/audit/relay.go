@@ -33,6 +33,7 @@ type RelayService struct {
 	mu              sync.Mutex
 	running         bool
 	stopChan        chan struct{}
+	workerDone      chan struct{}
 }
 
 func NewRelayService(
@@ -167,7 +168,9 @@ func (s *RelayService) StartWorker(ctx context.Context, interval time.Duration, 
 	}
 	s.running = true
 	s.stopChan = make(chan struct{})
+	s.workerDone = make(chan struct{})
 	stopChan := s.stopChan
+	workerDone := s.workerDone
 	s.mu.Unlock()
 
 	if interval <= 0 {
@@ -175,6 +178,8 @@ func (s *RelayService) StartWorker(ctx context.Context, interval time.Duration, 
 	}
 
 	go func() {
+		defer close(workerDone)
+
 		processTicker := time.NewTicker(interval)
 		defer processTicker.Stop()
 
@@ -218,7 +223,22 @@ func (s *RelayService) StartWorker(ctx context.Context, interval time.Duration, 
 }
 
 func (s *RelayService) StopWorker() {
-	s.stopWorker()
+	s.mu.Lock()
+	if !s.running {
+		workerDone := s.workerDone
+		s.mu.Unlock()
+		if workerDone != nil {
+			<-workerDone
+		}
+		return
+	}
+	s.running = false
+	stopChan := s.stopChan
+	workerDone := s.workerDone
+	close(stopChan)
+	s.mu.Unlock()
+
+	<-workerDone
 }
 
 func (s *RelayService) stopWorker() {

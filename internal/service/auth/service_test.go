@@ -2,8 +2,6 @@ package auth
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"testing"
 	"time"
@@ -12,6 +10,7 @@ import (
 	"disbursment-api/internal/httpapi/dto"
 	"disbursment-api/internal/repository"
 
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 	"golang.org/x/crypto/bcrypt"
 )
@@ -108,26 +107,31 @@ func (m *mockSessionStore) RevokeByTokenHash(ctx context.Context, tx repository.
 	return nil
 }
 
-type mockTransactor struct{}
+const (
+	testJWTSecret       = "super-secret-key"
+	testJWTIssuer       = "test-issuer"
+	testJWTAudience     = "test-audience"
+	testAccessTokenTTL  = 15 * time.Minute
+	testRefreshTokenTTL = 7 * 24 * time.Hour
+)
 
-func (m *mockTransactor) WithinTransaction(ctx context.Context, fn func(context.Context, repository.Transaction) error) error {
-	return fn(ctx, nil)
+func fixedAuthTime() time.Time {
+	return time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
 }
 
-func TestAuthService_Login(t *testing.T) {
+func newAuthServiceFixture(t *testing.T) (*Service, *mockUserStore, *mockSessionStore, repository.User, string) {
+	t.Helper()
+
 	userStore := newMockUserStore()
 	sessionStore := newMockSessionStore()
-	transactor := &mockTransactor{}
-
 	password := "securepassword123"
 	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.MinCost)
 	if err != nil {
 		t.Fatalf("failed to hash password: %v", err)
 	}
 
-	userID := uuid.New()
 	user := repository.User{
-		ID:           userID,
+		ID:           uuid.MustParse("110e8400-e29b-41d4-a716-446655440000"),
 		Username:     "testoperator",
 		PasswordHash: string(hashedPassword),
 		Role:         "OPERATOR",
@@ -135,36 +139,101 @@ func TestAuthService_Login(t *testing.T) {
 	userStore.users[user.Username] = user
 	userStore.byID[user.ID] = user
 
-	authService := NewService(userStore, sessionStore, transactor, "super-secret-key", 15*time.Minute, 7*24*time.Hour, nil)
+	authService := NewServiceWithIssuerAudience(
+		userStore,
+		sessionStore,
+		&mockTransactor{},
+		testJWTSecret,
+		testJWTIssuer,
+		testJWTAudience,
+		testAccessTokenTTL,
+		testRefreshTokenTTL,
+		nil,
+	)
+	authService.nowFunc = fixedAuthTime
+	return authService, userStore, sessionStore, user, password
+}
 
-	t.Run("successful login", func(t *testing.T) {
+func assertAccessTokenClaims(t *testing.T, tokenString string, user repository.User) {
+	t.Helper()
+
+	token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
+		if token.Method != jwt.SigningMethodHS256 {
+			return nil, errors.New("unexpected signing method")
+		}
+		return []byte(testJWTSecret), nil
+	}, jwt.WithoutClaimsValidation())
+	if err != nil {
+		t.Fatalf("failed to parse access token: %v", err)
+	}
+	if !token.Valid {
+		t.Fatal("expected access token to be valid")
+	}
+
+	claims, ok := token.Claims.(jwt.MapClaims)
+	if !ok {
+		t.Fatalf("expected map claims, got %T", token.Claims)
+	}
+	wantNumeric := map[string]float64{
+		"iat": float64(fixedAuthTime().Unix()),
+		"exp": float64(fixedAuthTime().Add(testAccessTokenTTL).Unix()),
+	}
+	wantStrings := map[string]string{
+		"sub":      user.ID.String(),
+		"username": user.Username,
+		"role":     user.Role,
+		"iss":      testJWTIssuer,
+		"aud":      testJWTAudience,
+	}
+	for claim, want := range wantStrings {
+		if got, ok := claims[claim].(string); !ok || got != want {
+			t.Errorf("claim %q = %v, want %q", claim, claims[claim], want)
+		}
+	}
+	for claim, want := range wantNumeric {
+		if got, ok := claims[claim].(float64); !ok || got != want {
+			t.Errorf("claim %q = %v, want %v", claim, claims[claim], want)
+		}
+	}
+}
+
+type mockTransactor struct{}
+
+func (m *mockTransactor) WithinTransaction(ctx context.Context, fn func(context.Context, repository.Transaction) error) error {
+	return fn(ctx, nil)
+}
+
+func TestAuthService_Login(t *testing.T) {
+	t.Run("successful login returns exact TTLs and claims", func(t *testing.T) {
+		authService, _, _, user, password := newAuthServiceFixture(t)
+
 		resp, err := authService.Login(context.Background(), dto.LoginRequest{
-			Username: "testoperator",
+			Username: user.Username,
 			Password: password,
 		})
 		if err != nil {
 			t.Fatalf("expected no error, got: %v", err)
 		}
-		if resp.AccessToken == "" {
-			t.Errorf("expected access_token to be set")
-		}
-		if resp.RefreshToken == "" {
-			t.Errorf("expected refresh_token to be set")
+		if resp.AccessToken == "" || resp.RefreshToken == "" {
+			t.Fatal("expected access and refresh tokens to be set")
 		}
 		if resp.TokenType != "Bearer" {
 			t.Errorf("expected token_type Bearer, got %s", resp.TokenType)
 		}
-		if resp.ExpiresIn != 900 {
-			t.Errorf("expected expires_in 900, got %d", resp.ExpiresIn)
+		if resp.ExpiresIn != int64(testAccessTokenTTL/time.Second) {
+			t.Errorf("expected expires_in %d, got %d", int64(testAccessTokenTTL/time.Second), resp.ExpiresIn)
 		}
-		if resp.RefreshExpiresIn != 604800 {
-			t.Errorf("expected refresh_expires_in 604800, got %d", resp.RefreshExpiresIn)
+		if resp.RefreshExpiresIn != int64(testRefreshTokenTTL/time.Second) {
+			t.Errorf("expected refresh_expires_in %d, got %d", int64(testRefreshTokenTTL/time.Second), resp.RefreshExpiresIn)
 		}
+		assertAccessTokenClaims(t, resp.AccessToken, user)
 	})
 
 	t.Run("wrong password returns INVALID_CREDENTIALS", func(t *testing.T) {
+		authService, _, _, user, _ := newAuthServiceFixture(t)
+
 		_, err := authService.Login(context.Background(), dto.LoginRequest{
-			Username: "testoperator",
+			Username: user.Username,
 			Password: "wrongpassword",
 		})
 		if err == nil {
@@ -177,9 +246,9 @@ func TestAuthService_Login(t *testing.T) {
 	})
 
 	t.Run("database error on find by username returns error", func(t *testing.T) {
-		errStore := newMockUserStore()
-		errStore.errToReturn = errors.New("db connection failure")
-		svc := NewService(errStore, sessionStore, transactor, "secret", 15*time.Minute, 7*24*time.Hour, nil)
+		userStore := newMockUserStore()
+		userStore.errToReturn = errors.New("db connection failure")
+		svc := NewService(userStore, newMockSessionStore(), &mockTransactor{}, testJWTSecret, testAccessTokenTTL, testRefreshTokenTTL, nil)
 		_, err := svc.Login(context.Background(), dto.LoginRequest{Username: "test", Password: "pwd"})
 		if err == nil {
 			t.Error("expected error on user store failure")
@@ -187,10 +256,11 @@ func TestAuthService_Login(t *testing.T) {
 	})
 
 	t.Run("session store create error", func(t *testing.T) {
+		authService, _, _, user, password := newAuthServiceFixture(t)
 		errSessionStore := newMockSessionStore()
 		errSessionStore.errToReturn = errors.New("db error")
-		svc := NewService(userStore, errSessionStore, transactor, "secret", 15*time.Minute, 7*24*time.Hour, nil)
-		_, err := svc.Login(context.Background(), dto.LoginRequest{Username: "testadmin", Password: password})
+		authService.sessionStore = errSessionStore
+		_, err := authService.Login(context.Background(), dto.LoginRequest{Username: user.Username, Password: password})
 		if err == nil {
 			t.Fatalf("expected error, got nil")
 		}
@@ -198,128 +268,95 @@ func TestAuthService_Login(t *testing.T) {
 }
 
 func TestAuthService_Refresh(t *testing.T) {
-	userStore := newMockUserStore()
-	sessionStore := newMockSessionStore()
-	transactor := &mockTransactor{}
+	t.Run("successful rotation rejects the old token", func(t *testing.T) {
+		authService, _, sessionStore, user, _ := newAuthServiceFixture(t)
+		refreshToken := "initial-refresh-token"
+		initialHash := hashToken(refreshToken)
+		sessionStore.sessions[initialHash] = repository.RefreshSession{
+			ID:        uuid.MustParse("220e8400-e29b-41d4-a716-446655440000"),
+			UserID:    user.ID,
+			TokenHash: initialHash,
+			ExpiresAt: fixedAuthTime().Add(time.Hour),
+		}
 
-	userID := uuid.New()
-	user := repository.User{
-		ID:           userID,
-		Username:     "testadmin",
-		PasswordHash: "hash",
-		Role:         "ADMIN",
-	}
-	userStore.users[user.Username] = user
-	userStore.byID[user.ID] = user
-
-	authService := NewService(userStore, sessionStore, transactor, "super-secret-key", 15*time.Minute, 7*24*time.Hour, nil)
-
-	refreshTokenStr := "initial-refresh-token"
-	h := sha256.Sum256([]byte(refreshTokenStr))
-	initialHash := hex.EncodeToString(h[:])
-
-	sessionStore.sessions[initialHash] = repository.RefreshSession{
-		ID:        uuid.New(),
-		UserID:    userID,
-		TokenHash: initialHash,
-		ExpiresAt: time.Now().Add(1 * time.Hour),
-	}
-
-	t.Run("successful refresh rotation", func(t *testing.T) {
-		resp, err := authService.Refresh(context.Background(), dto.RefreshRequest{
-			RefreshToken: refreshTokenStr,
-		})
+		resp, err := authService.Refresh(context.Background(), dto.RefreshRequest{RefreshToken: refreshToken})
 		if err != nil {
 			t.Fatalf("expected no error, got %v", err)
 		}
 		if resp.AccessToken == "" || resp.RefreshToken == "" {
-			t.Errorf("expected new access and refresh tokens")
+			t.Fatal("expected new access and refresh tokens")
+		}
+		if resp.ExpiresIn != int64(testAccessTokenTTL/time.Second) || resp.RefreshExpiresIn != int64(testRefreshTokenTTL/time.Second) {
+			t.Fatalf("unexpected TTL response: expires_in=%d refresh_expires_in=%d", resp.ExpiresIn, resp.RefreshExpiresIn)
+		}
+		assertAccessTokenClaims(t, resp.AccessToken, user)
+		if sessionStore.sessions[initialHash].RevokedAt == nil {
+			t.Fatal("expected old session to be revoked")
 		}
 
-		// Verify old token is revoked
-		oldSession := sessionStore.sessions[initialHash]
-		if oldSession.RevokedAt == nil {
-			t.Errorf("expected old session to be revoked")
+		replacement, err := authService.Refresh(context.Background(), dto.RefreshRequest{RefreshToken: resp.RefreshToken})
+		if err != nil {
+			t.Fatalf("expected returned replacement token to be usable, got %v", err)
 		}
-	})
+		if replacement.AccessToken == "" || replacement.RefreshToken == "" {
+			t.Fatal("expected replacement refresh to issue new access and refresh tokens")
+		}
+		assertAccessTokenClaims(t, replacement.AccessToken, user)
 
-	t.Run("reusing revoked refresh token fails with INVALID_REFRESH_TOKEN", func(t *testing.T) {
-		_, err := authService.Refresh(context.Background(), dto.RefreshRequest{
-			RefreshToken: refreshTokenStr,
-		})
-		if err == nil {
-			t.Fatalf("expected error, got nil")
-		}
-		domainErr := domain.AsError(err)
-		if domainErr.Code != domain.CodeInvalidRefreshToken {
-			t.Errorf("expected INVALID_REFRESH_TOKEN, got %s", domainErr.Code)
+		_, err = authService.Refresh(context.Background(), dto.RefreshRequest{RefreshToken: refreshToken})
+		if err == nil || domain.AsError(err).Code != domain.CodeInvalidRefreshToken {
+			t.Fatalf("expected INVALID_REFRESH_TOKEN for old token, got %v", err)
 		}
 	})
 
 	t.Run("empty refresh token fails with INVALID_REFRESH_TOKEN", func(t *testing.T) {
-		_, err := authService.Refresh(context.Background(), dto.RefreshRequest{
-			RefreshToken: "",
-		})
-		if err == nil {
-			t.Fatalf("expected error, got nil")
-		}
-		domainErr := domain.AsError(err)
-		if domainErr.Code != domain.CodeInvalidRefreshToken {
-			t.Errorf("expected INVALID_REFRESH_TOKEN, got %s", domainErr.Code)
+		authService, _, _, _, _ := newAuthServiceFixture(t)
+		_, err := authService.Refresh(context.Background(), dto.RefreshRequest{RefreshToken: ""})
+		if err == nil || domain.AsError(err).Code != domain.CodeInvalidRefreshToken {
+			t.Fatalf("expected INVALID_REFRESH_TOKEN, got %v", err)
 		}
 	})
 
 	t.Run("expired refresh token fails with INVALID_REFRESH_TOKEN", func(t *testing.T) {
-		expiredTokenStr := "expired-token"
-		hExp := sha256.Sum256([]byte(expiredTokenStr))
-		expHash := hex.EncodeToString(hExp[:])
-		sessionStore.sessions[expHash] = repository.RefreshSession{
-			ID:        uuid.New(),
-			UserID:    userID,
-			TokenHash: expHash,
-			ExpiresAt: time.Now().Add(-1 * time.Hour), // Expired
+		authService, _, sessionStore, user, _ := newAuthServiceFixture(t)
+		expiredToken := "expired-token"
+		expiredHash := hashToken(expiredToken)
+		sessionStore.sessions[expiredHash] = repository.RefreshSession{
+			ID:        uuid.MustParse("330e8400-e29b-41d4-a716-446655440000"),
+			UserID:    user.ID,
+			TokenHash: expiredHash,
+			ExpiresAt: fixedAuthTime().Add(-time.Hour),
 		}
 
-		_, err := authService.Refresh(context.Background(), dto.RefreshRequest{
-			RefreshToken: expiredTokenStr,
-		})
-		if err == nil {
-			t.Fatalf("expected error, got nil")
-		}
-		domainErr := domain.AsError(err)
-		if domainErr.Code != domain.CodeInvalidRefreshToken {
-			t.Errorf("expected INVALID_REFRESH_TOKEN, got %s", domainErr.Code)
+		_, err := authService.Refresh(context.Background(), dto.RefreshRequest{RefreshToken: expiredToken})
+		if err == nil || domain.AsError(err).Code != domain.CodeInvalidRefreshToken {
+			t.Fatalf("expected INVALID_REFRESH_TOKEN, got %v", err)
 		}
 	})
 
 	t.Run("non existent user for session fails with INVALID_REFRESH_TOKEN", func(t *testing.T) {
-		orphanTokenStr := "orphan-token"
-		hOrphan := sha256.Sum256([]byte(orphanTokenStr))
-		orphanHash := hex.EncodeToString(hOrphan[:])
+		authService, _, sessionStore, _, _ := newAuthServiceFixture(t)
+		orphanToken := "orphan-token"
+		orphanHash := hashToken(orphanToken)
 		sessionStore.sessions[orphanHash] = repository.RefreshSession{
-			ID:        uuid.New(),
-			UserID:    uuid.New(), // User not in userStore
+			ID:        uuid.MustParse("440e8400-e29b-41d4-a716-446655440000"),
+			UserID:    uuid.MustParse("550e8400-e29b-41d4-a716-446655440000"),
 			TokenHash: orphanHash,
-			ExpiresAt: time.Now().Add(1 * time.Hour),
+			ExpiresAt: fixedAuthTime().Add(time.Hour),
 		}
 
-		_, err := authService.Refresh(context.Background(), dto.RefreshRequest{
-			RefreshToken: orphanTokenStr,
-		})
-		if err == nil {
-			t.Fatalf("expected error, got nil")
-		}
-		domainErr := domain.AsError(err)
-		if domainErr.Code != domain.CodeInvalidRefreshToken {
-			t.Errorf("expected INVALID_REFRESH_TOKEN, got %s", domainErr.Code)
+		_, err := authService.Refresh(context.Background(), dto.RefreshRequest{RefreshToken: orphanToken})
+		if err == nil || domain.AsError(err).Code != domain.CodeInvalidRefreshToken {
+			t.Fatalf("expected INVALID_REFRESH_TOKEN, got %v", err)
 		}
 	})
 
 	t.Run("database error on FindByTokenHash propagates error", func(t *testing.T) {
+		authService, _, _, _, _ := newAuthServiceFixture(t)
 		errSessionStore := newMockSessionStore()
 		errSessionStore.errToReturn = errors.New("db failure")
-		svc := NewService(userStore, errSessionStore, transactor, "secret", 15*time.Minute, 7*24*time.Hour, nil)
-		_, err := svc.Refresh(context.Background(), dto.RefreshRequest{RefreshToken: "valid-token"})
+		authService.sessionStore = errSessionStore
+		_, err := authService.Refresh(context.Background(), dto.RefreshRequest{RefreshToken: "valid-token"})
 		if err == nil {
 			t.Error("expected error on session find failure")
 		}
@@ -327,59 +364,46 @@ func TestAuthService_Refresh(t *testing.T) {
 }
 
 func TestAuthService_Logout(t *testing.T) {
-	userStore := newMockUserStore()
-	sessionStore := newMockSessionStore()
-	transactor := &mockTransactor{}
+	t.Run("logout revokes session and rejects the old token", func(t *testing.T) {
+		authService, _, sessionStore, user, _ := newAuthServiceFixture(t)
+		refreshToken := "logout-refresh-token"
+		tokenHash := hashToken(refreshToken)
+		sessionStore.sessions[tokenHash] = repository.RefreshSession{
+			ID:        uuid.MustParse("660e8400-e29b-41d4-a716-446655440000"),
+			UserID:    user.ID,
+			TokenHash: tokenHash,
+			ExpiresAt: fixedAuthTime().Add(time.Hour),
+		}
 
-	authService := NewService(userStore, sessionStore, transactor, "super-secret-key", 15*time.Minute, 7*24*time.Hour, nil)
-
-	refreshTokenStr := "logout-refresh-token"
-	h := sha256.Sum256([]byte(refreshTokenStr))
-	tokenHash := hex.EncodeToString(h[:])
-
-	sessionStore.sessions[tokenHash] = repository.RefreshSession{
-		ID:        uuid.New(),
-		UserID:    uuid.New(),
-		TokenHash: tokenHash,
-		ExpiresAt: time.Now().Add(1 * time.Hour),
-	}
-
-	t.Run("logout revokes session", func(t *testing.T) {
-		err := authService.Logout(context.Background(), dto.LogoutRequest{
-			RefreshToken: refreshTokenStr,
-		})
-		if err != nil {
+		if err := authService.Logout(context.Background(), dto.LogoutRequest{RefreshToken: refreshToken}); err != nil {
 			t.Fatalf("expected no error, got %v", err)
 		}
-		session := sessionStore.sessions[tokenHash]
-		if session.RevokedAt == nil {
-			t.Errorf("expected session to be revoked")
+		if sessionStore.sessions[tokenHash].RevokedAt == nil {
+			t.Fatal("expected session to be revoked")
 		}
-	})
 
-	t.Run("repeated logout is idempotent success", func(t *testing.T) {
-		err := authService.Logout(context.Background(), dto.LogoutRequest{
-			RefreshToken: refreshTokenStr,
-		})
-		if err != nil {
+		if err := authService.Logout(context.Background(), dto.LogoutRequest{RefreshToken: refreshToken}); err != nil {
 			t.Fatalf("expected no error on repeated logout, got %v", err)
+		}
+		_, err := authService.Refresh(context.Background(), dto.RefreshRequest{RefreshToken: refreshToken})
+		if err == nil || domain.AsError(err).Code != domain.CodeInvalidRefreshToken {
+			t.Fatalf("expected INVALID_REFRESH_TOKEN for logged-out token, got %v", err)
 		}
 	})
 
 	t.Run("empty refresh token on logout is no-op success", func(t *testing.T) {
-		err := authService.Logout(context.Background(), dto.LogoutRequest{
-			RefreshToken: "",
-		})
-		if err != nil {
+		authService, _, _, _, _ := newAuthServiceFixture(t)
+		if err := authService.Logout(context.Background(), dto.LogoutRequest{RefreshToken: ""}); err != nil {
 			t.Fatalf("expected no error on empty logout request, got %v", err)
 		}
 	})
 
 	t.Run("database error on logout propagates error", func(t *testing.T) {
+		authService, _, _, _, _ := newAuthServiceFixture(t)
 		errSessionStore := newMockSessionStore()
 		errSessionStore.errToReturn = errors.New("db failure")
-		svc := NewService(userStore, errSessionStore, transactor, "secret", 15*time.Minute, 7*24*time.Hour, nil)
-		err := svc.Logout(context.Background(), dto.LogoutRequest{RefreshToken: "valid-token"})
+		authService.sessionStore = errSessionStore
+		err := authService.Logout(context.Background(), dto.LogoutRequest{RefreshToken: "valid-token"})
 		if err == nil {
 			t.Fatalf("expected error on logout db failure, got nil")
 		}

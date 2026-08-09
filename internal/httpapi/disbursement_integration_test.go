@@ -8,6 +8,8 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -46,7 +48,8 @@ func (m *mockDisbursementStore) FindByID(ctx context.Context, id uuid.UUID) (dom
 }
 
 func (m *mockDisbursementStore) List(ctx context.Context, filter repository.DisbursementFilter) ([]domain.Disbursement, int, error) {
-	var result []domain.Disbursement
+	search := strings.ToLower(strings.TrimSpace(filter.Search))
+	result := make([]domain.Disbursement, 0, len(m.items))
 	for _, d := range m.items {
 		if d.DeletedAt != nil {
 			continue
@@ -54,9 +57,66 @@ func (m *mockDisbursementStore) List(ctx context.Context, filter repository.Disb
 		if filter.Status != "" && d.Status != filter.Status {
 			continue
 		}
+		if search != "" && !strings.Contains(strings.ToLower(d.RecipientName), search) && !strings.Contains(strings.ToLower(d.AccountNumber), search) {
+			continue
+		}
+		if filter.DateRange != nil && (d.CreatedAt.Before(filter.DateRange.FromInclusive) || !d.CreatedAt.Before(filter.DateRange.ToExclusive)) {
+			continue
+		}
 		result = append(result, d)
 	}
-	return result, len(result), nil
+
+	sort.SliceStable(result, func(i, j int) bool {
+		left := result[i]
+		right := result[j]
+		comparison := 0
+		switch filter.SortBy {
+		case "amount":
+			switch {
+			case left.Amount < right.Amount:
+				comparison = -1
+			case left.Amount > right.Amount:
+				comparison = 1
+			}
+		case "recipient_name":
+			comparison = strings.Compare(left.RecipientName, right.RecipientName)
+		case "status":
+			comparison = strings.Compare(string(left.Status), string(right.Status))
+		default:
+			switch {
+			case left.CreatedAt.Before(right.CreatedAt):
+				comparison = -1
+			case left.CreatedAt.After(right.CreatedAt):
+				comparison = 1
+			}
+		}
+		if comparison == 0 {
+			comparison = strings.Compare(left.ID.String(), right.ID.String())
+		}
+		if strings.ToLower(filter.SortOrder) == "asc" {
+			return comparison < 0
+		}
+		return comparison > 0
+	})
+
+	total := len(result)
+	page := filter.Page
+	if page < 1 {
+		page = domain.DefaultPage
+	}
+	limit := filter.Limit
+	if limit < 1 || limit > domain.MaximumLimit {
+		limit = domain.DefaultLimit
+	}
+	start := (page - 1) * limit
+	if start >= total {
+		return []domain.Disbursement{}, total, nil
+	}
+	end := start + limit
+	if end > total {
+		end = total
+	}
+	return result[start:end], total, nil
 }
 
 func (m *mockDisbursementStore) UpdateStatus(ctx context.Context, tx repository.Transaction, id uuid.UUID, decision domain.Decision) (domain.Disbursement, error) {
@@ -239,7 +299,35 @@ func TestDisbursementEndpointsIntegration(t *testing.T) {
 	})
 
 	t.Run("GET /disbursements - List Disbursements", func(t *testing.T) {
-		req, _ := http.NewRequest(http.MethodGet, "/disbursements?page=1&limit=10", nil)
+		budiID := uuid.MustParse("11111111-1111-4111-8111-111111111111")
+		citraID := uuid.MustParse("22222222-2222-4222-8222-222222222222")
+		listCreatedBy := operatorID
+		store.items[budiID] = domain.Disbursement{
+			ID:            budiID,
+			RecipientName: "Budi Santoso",
+			AccountNumber: "2222222222",
+			BankCode:      "BCA",
+			Amount:        125000,
+			AdminFee:      domain.LowerTierAdminFee,
+			Status:        domain.StatusPending,
+			CreatedBy:     listCreatedBy,
+			CreatedAt:     time.Date(2026, time.January, 2, 10, 0, 0, 0, time.UTC),
+			UpdatedAt:     time.Date(2026, time.January, 2, 10, 0, 0, 0, time.UTC),
+		}
+		store.items[citraID] = domain.Disbursement{
+			ID:            citraID,
+			RecipientName: "Citra Sari",
+			AccountNumber: "3333333333",
+			BankCode:      "BRI",
+			Amount:        75000,
+			AdminFee:      domain.LowerTierAdminFee,
+			Status:        domain.StatusPending,
+			CreatedBy:     listCreatedBy,
+			CreatedAt:     time.Date(2026, time.January, 3, 10, 0, 0, 0, time.UTC),
+			UpdatedAt:     time.Date(2026, time.January, 3, 10, 0, 0, 0, time.UTC),
+		}
+
+		req := httptest.NewRequest(http.MethodGet, "/disbursements?page=1&limit=10&status=PENDING", nil)
 		req.Header.Set("Authorization", "Bearer "+operatorToken)
 		w := httptest.NewRecorder()
 
@@ -247,6 +335,72 @@ func TestDisbursementEndpointsIntegration(t *testing.T) {
 
 		if w.Code != http.StatusOK {
 			t.Fatalf("expected status 200, got %d: %s", w.Code, w.Body.String())
+		}
+
+		var listResponse struct {
+			Success bool                       `json:"success"`
+			Data    []dto.DisbursementResponse `json:"data"`
+			Meta    *struct {
+				Page       int `json:"page"`
+				Limit      int `json:"limit"`
+				Total      int `json:"total"`
+				TotalPages int `json:"total_pages"`
+			} `json:"meta"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &listResponse); err != nil {
+			t.Fatalf("decode list response: %v", err)
+		}
+		if !listResponse.Success {
+			t.Fatal("expected successful list response")
+		}
+		if len(listResponse.Data) != 3 {
+			t.Fatalf("list data length = %d, want 3", len(listResponse.Data))
+		}
+		if listResponse.Meta == nil || listResponse.Meta.Total != 3 || listResponse.Meta.TotalPages != 1 {
+			t.Fatalf("list metadata = %+v, want total=3 total_pages=1", listResponse.Meta)
+		}
+
+		searchRequest := httptest.NewRequest(http.MethodGet, "/disbursements?search=budi", nil)
+		searchRequest.Header.Set("Authorization", "Bearer "+operatorToken)
+		searchResponse := httptest.NewRecorder()
+		router.ServeHTTP(searchResponse, searchRequest)
+		if searchResponse.Code != http.StatusOK {
+			t.Fatalf("search status = %d, want 200: %s", searchResponse.Code, searchResponse.Body.String())
+		}
+		var searchPayload struct {
+			Data []dto.DisbursementResponse `json:"data"`
+		}
+		if err := json.Unmarshal(searchResponse.Body.Bytes(), &searchPayload); err != nil {
+			t.Fatalf("decode search response: %v", err)
+		}
+		if len(searchPayload.Data) != 1 || searchPayload.Data[0].ID != budiID {
+			t.Fatalf("search data = %+v, want only Budi %s", searchPayload.Data, budiID)
+		}
+
+		pageRequest := httptest.NewRequest(http.MethodGet, "/disbursements?date_from=2026-01-01&date_to=2026-01-31&sort_by=amount&sort_order=asc&page=1&limit=1", nil)
+		pageRequest.Header.Set("Authorization", "Bearer "+operatorToken)
+		pageResponse := httptest.NewRecorder()
+		router.ServeHTTP(pageResponse, pageRequest)
+		if pageResponse.Code != http.StatusOK {
+			t.Fatalf("date/sort/page status = %d, want 200: %s", pageResponse.Code, pageResponse.Body.String())
+		}
+		var pagePayload struct {
+			Data []dto.DisbursementResponse `json:"data"`
+			Meta *struct {
+				Page       int `json:"page"`
+				Limit      int `json:"limit"`
+				Total      int `json:"total"`
+				TotalPages int `json:"total_pages"`
+			} `json:"meta"`
+		}
+		if err := json.Unmarshal(pageResponse.Body.Bytes(), &pagePayload); err != nil {
+			t.Fatalf("decode date/sort/page response: %v", err)
+		}
+		if len(pagePayload.Data) != 1 || pagePayload.Data[0].ID != citraID {
+			t.Fatalf("date/sort/page data = %+v, want only Citra %s", pagePayload.Data, citraID)
+		}
+		if pagePayload.Meta == nil || pagePayload.Meta.Page != 1 || pagePayload.Meta.Limit != 1 || pagePayload.Meta.Total != 2 || pagePayload.Meta.TotalPages != 2 {
+			t.Fatalf("date/sort/page metadata = %+v, want page=1 limit=1 total=2 total_pages=2", pagePayload.Meta)
 		}
 	})
 

@@ -103,7 +103,16 @@ func Authenticate(jwtSecret string, expectedIssuer string, expectedAudience stri
 			return
 		}
 
-		username, _ := claims["username"].(string)
+		username, usernameOK := claims["username"].(string)
+		if !usernameOK || strings.TrimSpace(username) == "" {
+			if collector != nil {
+				collector.RecordAuthFailure("unauthorized")
+			}
+			response.WriteError(c.Writer, RequestIDFromContext(c.Request.Context()), domain.Unauthorized())
+			c.Abort()
+			return
+		}
+
 		roleStr, _ := claims["role"].(string)
 		role := domain.UserRole(roleStr)
 

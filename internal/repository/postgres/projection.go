@@ -47,8 +47,8 @@ func (store *AuditProjectionStore) InsertProjection(ctx context.Context, transac
 			event.Action,
 			event.ActorID,
 			event.RequestID,
-			event.BeforeData,
-			event.AfterData,
+			nullableJSON(event.BeforeData),
+			nullableJSON(event.AfterData),
 			event.OccurredAt,
 		)
 		if err != nil {
@@ -70,8 +70,8 @@ func (store *AuditProjectionStore) InsertProjection(ctx context.Context, transac
 		event.Action,
 		event.ActorID,
 		event.RequestID,
-		event.BeforeData,
-		event.AfterData,
+		nullableJSON(event.BeforeData),
+		nullableJSON(event.AfterData),
 		event.OccurredAt,
 	)
 	if err != nil {
