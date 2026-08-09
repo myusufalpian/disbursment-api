@@ -19,15 +19,37 @@ func newTestTx(tx *sqlx.Tx) repository.Transaction {
 	return &transaction{context: context.Background(), tx: tx}
 }
 
+func beginSQLMockTx(t *testing.T, mock sqlmock.Sqlmock, db *sqlx.DB) *sqlx.Tx {
+	t.Helper()
+	tx, err := db.BeginTxx(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("BeginTxx failed: %v", err)
+	}
+	mock.ExpectRollback()
+	t.Cleanup(func() {
+		if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
+			t.Errorf("rollback test transaction: %v", err)
+		}
+	})
+	return tx
+}
+
 func TestDisbursementStore_Insert(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("failed to open sqlmock: %v", err)
 	}
 	defer db.Close()
+	t.Cleanup(func() {
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("sqlmock expectations: %v", err)
+		}
+	})
 
 	sqlxDB := sqlx.NewDb(db, "postgres")
 	store := NewDisbursementStore(sqlxDB)
+	now := time.Date(2026, time.August, 9, 10, 0, 0, 0, time.UTC)
+	store.now = func() time.Time { return now }
 
 	d := domain.Disbursement{
 		ID:            uuid.New(),
@@ -39,8 +61,8 @@ func TestDisbursementStore_Insert(t *testing.T) {
 		Status:        domain.StatusPending,
 		Note:          "Test note",
 		CreatedBy:     uuid.New(),
-		CreatedAt:     time.Now().UTC(),
-		UpdatedAt:     time.Now().UTC(),
+		CreatedAt:     now.Add(-time.Hour),
+		UpdatedAt:     now,
 	}
 
 	t.Run("Insert success", func(t *testing.T) {
@@ -48,15 +70,12 @@ func TestDisbursementStore_Insert(t *testing.T) {
 		mock.ExpectExec("^INSERT INTO disbursements").
 			WithArgs(
 				d.ID, d.RecipientName, d.AccountNumber, d.BankCode, d.Amount, d.AdminFee,
-				string(d.Status), sqlmock.AnyArg(), d.CreatedBy, sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
-				sqlmock.AnyArg(), d.CreatedAt, d.UpdatedAt,
+				string(d.Status), d.Note, d.CreatedBy, nil, nil, nil,
+				nil, d.CreatedAt, d.UpdatedAt,
 			).
 			WillReturnResult(sqlmock.NewResult(1, 1))
 
-		tx, err := sqlxDB.BeginTxx(context.Background(), nil)
-		if err != nil {
-			t.Fatalf("BeginTxx failed: %v", err)
-		}
+		tx := beginSQLMockTx(t, mock, sqlxDB)
 
 		err = store.Insert(context.Background(), newTestTx(tx), d)
 		if err != nil {
@@ -69,7 +88,7 @@ func TestDisbursementStore_Insert(t *testing.T) {
 		mock.ExpectExec("^INSERT INTO disbursements").
 			WillReturnError(errors.New("db write failure"))
 
-		tx, _ := sqlxDB.BeginTxx(context.Background(), nil)
+		tx := beginSQLMockTx(t, mock, sqlxDB)
 		err := store.Insert(context.Background(), newTestTx(tx), d)
 		if err == nil {
 			t.Fatalf("expected error for db failure")
@@ -83,12 +102,17 @@ func TestDisbursementStore_FindByID(t *testing.T) {
 		t.Fatalf("failed to open sqlmock: %v", err)
 	}
 	defer db.Close()
+	t.Cleanup(func() {
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("sqlmock expectations: %v", err)
+		}
+	})
 
 	sqlxDB := sqlx.NewDb(db, "postgres")
 	store := NewDisbursementStore(sqlxDB)
 	targetID := uuid.New()
 	creatorID := uuid.New()
-	now := time.Now().UTC()
+	now := time.Date(2026, time.August, 9, 10, 30, 0, 0, time.UTC)
 
 	t.Run("FindByID found", func(t *testing.T) {
 		rows := sqlmock.NewRows([]string{
@@ -135,16 +159,36 @@ func TestDisbursementStore_List(t *testing.T) {
 		t.Fatalf("failed to open sqlmock: %v", err)
 	}
 	defer db.Close()
+	t.Cleanup(func() {
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("sqlmock expectations: %v", err)
+		}
+	})
 
 	sqlxDB := sqlx.NewDb(db, "postgres")
 	store := NewDisbursementStore(sqlxDB)
 	targetID := uuid.New()
 	creatorID := uuid.New()
-	now := time.Now().UTC()
+	now := time.Date(2026, time.August, 9, 10, 30, 0, 0, time.UTC)
 
 	t.Run("List with search and date range", func(t *testing.T) {
+		dr, err := domain.NewUTCDateRange(now.Add(-24*time.Hour), now.Add(24*time.Hour))
+		if err != nil {
+			t.Fatalf("create date range: %v", err)
+		}
+		filter := repository.DisbursementFilter{
+			Page:      1,
+			Limit:     10,
+			Status:    domain.StatusPending,
+			Search:    "John",
+			SortBy:    "amount",
+			SortOrder: "asc",
+			DateRange: &dr,
+		}
+
 		countRows := sqlmock.NewRows([]string{"count"}).AddRow(1)
 		mock.ExpectQuery("^SELECT COUNT\\(\\*\\) FROM disbursements WHERE").
+			WithArgs(string(domain.StatusPending), "%John%", dr.FromInclusive, dr.ToExclusive).
 			WillReturnRows(countRows)
 
 		rows := sqlmock.NewRows([]string{
@@ -158,18 +202,8 @@ func TestDisbursementStore_List(t *testing.T) {
 		)
 
 		mock.ExpectQuery("^SELECT (.+) FROM disbursements WHERE").
+			WithArgs(string(domain.StatusPending), "%John%", dr.FromInclusive, dr.ToExclusive, 10, 0).
 			WillReturnRows(rows)
-
-		dr, _ := domain.NewUTCDateRange(now.Add(-24*time.Hour), now.Add(24*time.Hour))
-		filter := repository.DisbursementFilter{
-			Page:      1,
-			Limit:     10,
-			Status:    domain.StatusPending,
-			Search:    "John",
-			SortBy:    "amount",
-			SortOrder: "asc",
-			DateRange: &dr,
-		}
 
 		items, total, err := store.List(context.Background(), filter)
 		if err != nil {
@@ -187,12 +221,18 @@ func TestDisbursementStore_UpdateStatusAndSoftDelete(t *testing.T) {
 		t.Fatalf("failed to open sqlmock: %v", err)
 	}
 	defer db.Close()
+	t.Cleanup(func() {
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("sqlmock expectations: %v", err)
+		}
+	})
 
 	sqlxDB := sqlx.NewDb(db, "postgres")
 	store := NewDisbursementStore(sqlxDB)
 	targetID := uuid.New()
 	actorID := uuid.New()
-	now := time.Now().UTC()
+	now := time.Date(2026, time.August, 9, 11, 0, 0, 0, time.UTC)
+	store.now = func() time.Time { return now }
 
 	t.Run("UpdateStatus success", func(t *testing.T) {
 		mock.ExpectBegin()
@@ -207,10 +247,10 @@ func TestDisbursementStore_UpdateStatusAndSoftDelete(t *testing.T) {
 		)
 
 		mock.ExpectQuery("^UPDATE disbursements SET status = \\$1").
-			WithArgs(string(domain.StatusApproved), actorID, "Looks good", sqlmock.AnyArg(), targetID).
+			WithArgs(string(domain.StatusApproved), actorID, "Looks good", now, targetID).
 			WillReturnRows(rows)
 
-		tx, _ := sqlxDB.BeginTxx(context.Background(), nil)
+		tx := beginSQLMockTx(t, mock, sqlxDB)
 		decision := domain.Decision{
 			Status:  domain.StatusApproved,
 			ActorID: actorID,
@@ -239,10 +279,10 @@ func TestDisbursementStore_UpdateStatusAndSoftDelete(t *testing.T) {
 		)
 
 		mock.ExpectQuery("^UPDATE disbursements SET deleted_at = \\$1").
-			WithArgs(sqlmock.AnyArg(), targetID).
+			WithArgs(now, targetID).
 			WillReturnRows(rows)
 
-		tx, _ := sqlxDB.BeginTxx(context.Background(), nil)
+		tx := beginSQLMockTx(t, mock, sqlxDB)
 		_, wasDeleted, err := store.SoftDelete(context.Background(), newTestTx(tx), targetID)
 		if err != nil {
 			t.Fatalf("SoftDelete failed: %v", err)
@@ -272,7 +312,7 @@ func TestDisbursementStore_UpdateStatusAndSoftDelete(t *testing.T) {
 			WithArgs(targetID).
 			WillReturnRows(checkRows)
 
-		tx, _ := sqlxDB.BeginTxx(context.Background(), nil)
+		tx := beginSQLMockTx(t, mock, sqlxDB)
 		decision := domain.Decision{Status: domain.StatusApproved, ActorID: actorID}
 		_, err := store.UpdateStatus(context.Background(), newTestTx(tx), targetID, decision)
 		if err == nil {
@@ -300,7 +340,7 @@ func TestDisbursementStore_UpdateStatusAndSoftDelete(t *testing.T) {
 			WithArgs(targetID).
 			WillReturnRows(checkRows)
 
-		tx, _ := sqlxDB.BeginTxx(context.Background(), nil)
+		tx := beginSQLMockTx(t, mock, sqlxDB)
 		res, wasDeleted, err := store.SoftDelete(context.Background(), newTestTx(tx), targetID)
 		if err != nil {
 			t.Fatalf("expected nil error when already deleted, got %v", err)
@@ -323,10 +363,13 @@ func TestDisbursementStore_UpdateStatusAndSoftDelete(t *testing.T) {
 			WithArgs(targetID).
 			WillReturnError(sql.ErrNoRows)
 
-		tx, _ := sqlxDB.BeginTxx(context.Background(), nil)
+		tx := beginSQLMockTx(t, mock, sqlxDB)
 		_, _, err := store.SoftDelete(context.Background(), newTestTx(tx), targetID)
 		if err == nil || !repository.IsNotFound(err) {
 			t.Fatalf("expected IsNotFound error, got %v", err)
+		}
+		if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
+			t.Fatalf("rollback first soft-delete transaction: %v", err)
 		}
 
 		// 2. ErrNoRows on DELETE -> Check query returns APPROVED record -> 409 CONFLICT
@@ -348,7 +391,7 @@ func TestDisbursementStore_UpdateStatusAndSoftDelete(t *testing.T) {
 			WithArgs(targetID).
 			WillReturnRows(checkRows)
 
-		tx2, _ := sqlxDB.BeginTxx(context.Background(), nil)
+		tx2 := beginSQLMockTx(t, mock, sqlxDB)
 		_, _, err2 := store.SoftDelete(context.Background(), newTestTx(tx2), targetID)
 		if err2 == nil || !repository.IsConstraint(err2) {
 			t.Fatalf("expected IsConstraint error for approved record, got %v", err2)

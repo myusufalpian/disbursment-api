@@ -3,6 +3,8 @@ package response
 import (
 	"encoding/json"
 	"net/http"
+	"strconv"
+	"time"
 
 	"disbursment-api/internal/domain"
 )
@@ -42,6 +44,13 @@ func WriteNoContent(writer http.ResponseWriter) {
 
 func WriteError(writer http.ResponseWriter, requestID string, err error) {
 	domainError := domain.AsError(err)
+	if domainError.RetryAfter > 0 {
+		seconds := int64(domainError.RetryAfter / time.Second)
+		if domainError.RetryAfter%time.Second != 0 {
+			seconds++
+		}
+		writer.Header().Set("Retry-After", strconv.FormatInt(seconds, 10))
+	}
 	writeJSON(writer, domainError.Status, Error{
 		Success: false,
 		Error: Body{

@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"encoding/json"
 	"net/http"
 	"strings"
 	"time"
@@ -72,10 +73,8 @@ func (h *DisbursementHandler) Create(c *gin.Context) {
 	}
 
 	if result.IsReplay && result.ReplayResponse != nil {
-		c.Header("X-Cache", "HIT")
-		c.Writer.Header().Set("Content-Type", "application/json; charset=utf-8")
-		c.Writer.WriteHeader(result.ReplayResponse.StatusCode)
-		_, _ = c.Writer.Write(result.ReplayResponse.Body)
+		c.Header("X-Idempotent-Replayed", "true")
+		response.WriteSuccess(c.Writer, result.ReplayResponse.StatusCode, json.RawMessage(result.ReplayResponse.Body), nil)
 		return
 	}
 

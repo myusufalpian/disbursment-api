@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"testing"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 	"disbursment-api/internal/observability/metrics"
 	"disbursment-api/internal/repository"
 	"disbursment-api/internal/service/auth"
+	"disbursment-api/internal/service/disbursement"
 
 	"github.com/google/uuid"
 	"golang.org/x/crypto/bcrypt"
@@ -101,18 +103,35 @@ func (n *noopTransactor) WithinTransaction(ctx context.Context, fn func(context.
 	return fn(ctx, nil)
 }
 
-func TestAuthHTTPIntegration(t *testing.T) {
+const integrationRequestID = "770e8400-e29b-41d4-a716-446655440000"
+
+type authHTTPFixture struct {
+	router   http.Handler
+	password string
+}
+
+type errorResponseEnvelope struct {
+	Success bool `json:"success"`
+	Error   struct {
+		Code    domain.ErrorCode    `json:"code"`
+		Message string              `json:"message"`
+		Details []domain.FieldError `json:"details"`
+	} `json:"error"`
+	RequestID string `json:"request_id"`
+}
+
+func newAuthHTTPFixture(t *testing.T) authHTTPFixture {
+	t.Helper()
+
 	userStore := newInMemoryUserStore()
 	sessionStore := newInMemorySessionStore()
-	transactor := &noopTransactor{}
-
 	password := "operatorpass123"
 	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.MinCost)
 	if err != nil {
 		t.Fatalf("failed to hash password: %v", err)
 	}
 
-	userID := uuid.New()
+	userID := uuid.MustParse("880e8400-e29b-41d4-a716-446655440000")
 	user := repository.User{
 		ID:           userID,
 		Username:     "local_test_operator",
@@ -122,197 +141,304 @@ func TestAuthHTTPIntegration(t *testing.T) {
 	userStore.users[user.Username] = user
 	userStore.byID[user.ID] = user
 
-	authService := auth.NewService(userStore, sessionStore, transactor, "test-secret-key-12345", 15*time.Minute, 7*24*time.Hour, nil)
+	const secret = "test-secret-key-12345"
+	authService := auth.NewService(userStore, sessionStore, &noopTransactor{}, secret, 15*time.Minute, 7*24*time.Hour, nil)
 	validatorEngine, err := validation.New()
 	if err != nil {
 		t.Fatalf("validator init failed: %v", err)
 	}
-
 	authHandler := httpapi.NewAuthHandler(authService, validatorEngine)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	metricsCollector := metrics.NewMetricsCollector()
-	router, err := httpapi.NewRouter(1<<20, logger, "test-secret-key-12345", "disbursement-api", "disbursement-api-users", authHandler, nil, metricsCollector, "test-metrics-token", nil)
+	router, err := httpapi.NewRouter(1<<20, logger, secret, "disbursement-api", "disbursement-api-users", authHandler, nil, metricsCollector, "test-metrics-token", nil)
 	if err != nil {
 		t.Fatalf("router init failed: %v", err)
 	}
+	return authHTTPFixture{router: router, password: password}
+}
 
-	var refreshToken string
+func newJSONRequest(t *testing.T, method string, path string, payload any) *http.Request {
+	t.Helper()
+	body, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("failed to marshal request: %v", err)
+	}
+	request, err := http.NewRequest(method, path, bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("failed to create request: %v", err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-Request-ID", integrationRequestID)
+	return request
+}
 
-	t.Run("POST /auth/login - valid credentials", func(t *testing.T) {
-		body, _ := json.Marshal(dto.LoginRequest{
+func newRawRequest(t *testing.T, method string, path string, body string) *http.Request {
+	t.Helper()
+	request, err := http.NewRequest(method, path, bytes.NewBufferString(body))
+	if err != nil {
+		t.Fatalf("failed to create request: %v", err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-Request-ID", integrationRequestID)
+	return request
+}
+
+func newCanonicalDisbursementHTTPFixture(t *testing.T) (http.Handler, uuid.UUID) {
+	t.Helper()
+
+	const secret = "test-secret-key-12345"
+	actorID := uuid.MustParse("990e8400-e29b-41d4-a716-446655440000")
+	store := newMockDisbursementStore()
+	outboxStore := &mockAuditOutboxStore{}
+	disbursementService, err := disbursement.NewService(store, outboxStore, &noopTransactor{}, nil, nil)
+	if err != nil {
+		t.Fatalf("failed to create disbursement service: %v", err)
+	}
+	validatorEngine, err := validation.New()
+	if err != nil {
+		t.Fatalf("validator init failed: %v", err)
+	}
+	disbursementHandler := httpapi.NewDisbursementHandler(disbursementService, validatorEngine)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	router, err := httpapi.NewRouter(1<<20, logger, secret, "disbursement-api", "disbursement-api-users", nil, disbursementHandler, nil, "test-metrics-token", nil)
+	if err != nil {
+		t.Fatalf("router init failed: %v", err)
+	}
+	return router, actorID
+}
+
+func loginHTTP(t *testing.T, fixture authHTTPFixture) dto.TokenResponse {
+	t.Helper()
+	request := newJSONRequest(t, http.MethodPost, "/api/v1/auth/login", dto.LoginRequest{
+		Username: "local_test_operator",
+		Password: fixture.password,
+	})
+	response := httptest.NewRecorder()
+	fixture.router.ServeHTTP(response, request)
+	return assertTokenSuccessResponse(t, response, "")
+}
+
+func assertExactJSONKeys(t *testing.T, raw map[string]json.RawMessage, want ...string) {
+	t.Helper()
+	if len(raw) != len(want) {
+		t.Fatalf("expected JSON keys %v, got %v", want, raw)
+	}
+	for _, key := range want {
+		if _, ok := raw[key]; !ok {
+			t.Fatalf("expected JSON key %q in %v", key, raw)
+		}
+	}
+}
+
+func assertTokenSuccessResponse(t *testing.T, response *httptest.ResponseRecorder, previousRefreshToken string) dto.TokenResponse {
+	t.Helper()
+	if response.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", response.Code, response.Body.String())
+	}
+	if got := response.Header().Get("Content-Type"); got != "application/json; charset=utf-8" {
+		t.Fatalf("expected exact JSON content type, got %q", got)
+	}
+
+	var rawEnvelope map[string]json.RawMessage
+	if err := json.Unmarshal(response.Body.Bytes(), &rawEnvelope); err != nil {
+		t.Fatalf("failed to parse token response: %v", err)
+	}
+	assertExactJSONKeys(t, rawEnvelope, "success", "data")
+
+	var envelope struct {
+		Success bool              `json:"success"`
+		Data    dto.TokenResponse `json:"data"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &envelope); err != nil {
+		t.Fatalf("failed to parse token response: %v", err)
+	}
+	if !envelope.Success || envelope.Data.AccessToken == "" || envelope.Data.RefreshToken == "" {
+		t.Fatalf("expected successful token response, got %+v", envelope)
+	}
+	if previousRefreshToken != "" && envelope.Data.RefreshToken == previousRefreshToken {
+		t.Fatalf("expected rotated refresh token, got the previous token")
+	}
+	if envelope.Data.TokenType != "Bearer" || envelope.Data.ExpiresIn != 900 || envelope.Data.RefreshExpiresIn != 604800 {
+		t.Fatalf("unexpected token response TTL/type: %+v", envelope.Data)
+	}
+
+	var rawData map[string]json.RawMessage
+	if err := json.Unmarshal(rawEnvelope["data"], &rawData); err != nil {
+		t.Fatalf("failed to parse token data: %v", err)
+	}
+	assertExactJSONKeys(t, rawData, "access_token", "refresh_token", "token_type", "expires_in", "refresh_expires_in")
+	return envelope.Data
+}
+
+func assertHTTPError(t *testing.T, response *httptest.ResponseRecorder, status int, code domain.ErrorCode, message string, details []domain.FieldError) {
+	t.Helper()
+	if response.Code != status {
+		t.Fatalf("expected status %d, got %d: %s", status, response.Code, response.Body.String())
+	}
+	if got := response.Header().Get("Content-Type"); got != "application/json; charset=utf-8" {
+		t.Fatalf("expected exact JSON content type, got %q", got)
+	}
+
+	var envelope errorResponseEnvelope
+	if err := json.Unmarshal(response.Body.Bytes(), &envelope); err != nil {
+		t.Fatalf("failed to parse error response: %v", err)
+	}
+	if envelope.Success || envelope.Error.Code != code || envelope.Error.Message != message || envelope.RequestID != integrationRequestID {
+		t.Fatalf("unexpected error envelope: %+v", envelope)
+	}
+	if !reflect.DeepEqual(envelope.Error.Details, details) {
+		t.Fatalf("expected error details %#v, got %#v", details, envelope.Error.Details)
+	}
+
+	var rawEnvelope map[string]json.RawMessage
+	if err := json.Unmarshal(response.Body.Bytes(), &rawEnvelope); err != nil {
+		t.Fatalf("failed to parse raw error response: %v", err)
+	}
+	assertExactJSONKeys(t, rawEnvelope, "success", "error", "request_id")
+	var rawError map[string]json.RawMessage
+	if err := json.Unmarshal(rawEnvelope["error"], &rawError); err != nil {
+		t.Fatalf("failed to parse raw error body: %v", err)
+	}
+	if len(details) == 0 {
+		assertExactJSONKeys(t, rawError, "code", "message")
+	} else {
+		assertExactJSONKeys(t, rawError, "code", "message", "details")
+	}
+}
+
+func TestAuthHTTPIntegration(t *testing.T) {
+	t.Run("POST /api/v1/auth/login - valid credentials returns exact TTLs", func(t *testing.T) {
+		fixture := newAuthHTTPFixture(t)
+		request := newJSONRequest(t, http.MethodPost, "/api/v1/auth/login", dto.LoginRequest{
 			Username: "local_test_operator",
-			Password: password,
+			Password: fixture.password,
 		})
-		req, _ := http.NewRequest(http.MethodPost, "/auth/login", bytes.NewReader(body))
-		req.Header.Set("Content-Type", "application/json")
-		w := httptest.NewRecorder()
-
-		router.ServeHTTP(w, req)
-
-		if w.Code != http.StatusOK {
-			t.Fatalf("expected status 200, got %d: %s", w.Code, w.Body.String())
-		}
-
-		var responseEnvelope struct {
-			Success bool              `json:"success"`
-			Data    dto.TokenResponse `json:"data"`
-		}
-		if err := json.Unmarshal(w.Body.Bytes(), &responseEnvelope); err != nil {
-			t.Fatalf("failed to parse login response: %v", err)
-		}
-
-		if !responseEnvelope.Success {
-			t.Errorf("expected success: true")
-		}
-		if responseEnvelope.Data.AccessToken == "" {
-			t.Errorf("expected access_token")
-		}
-		if responseEnvelope.Data.RefreshToken == "" {
-			t.Errorf("expected refresh_token")
-		}
-		if responseEnvelope.Data.TokenType != "Bearer" {
-			t.Errorf("expected Bearer, got %s", responseEnvelope.Data.TokenType)
-		}
-
-		refreshToken = responseEnvelope.Data.RefreshToken
+		response := httptest.NewRecorder()
+		fixture.router.ServeHTTP(response, request)
+		assertTokenSuccessResponse(t, response, "")
 	})
 
-	t.Run("POST /auth/login - invalid credentials", func(t *testing.T) {
-		body, _ := json.Marshal(dto.LoginRequest{
+	t.Run("POST /api/v1/disbursements - signed operator creates pending disbursement", func(t *testing.T) {
+		router, actorID := newCanonicalDisbursementHTTPFixture(t)
+		request := newJSONRequest(t, http.MethodPost, "/api/v1/disbursements", dto.CreateDisbursementRequest{
+			RecipientName: "Canonical Recipient",
+			AccountNumber: "1234567890",
+			BankCode:      "bca",
+			Amount:        500000,
+			Note:          "Canonical contract",
+		})
+		request.Header.Set("Authorization", "Bearer "+generateTestToken("test-secret-key-12345", actorID, domain.RoleOperator))
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+
+		if response.Code != http.StatusCreated {
+			t.Fatalf("expected status 201, got %d: %s", response.Code, response.Body.String())
+		}
+		if got := response.Header().Get("Content-Type"); got != "application/json; charset=utf-8" {
+			t.Fatalf("expected exact JSON content type, got %q", got)
+		}
+		var rawEnvelope map[string]json.RawMessage
+		if err := json.Unmarshal(response.Body.Bytes(), &rawEnvelope); err != nil {
+			t.Fatalf("failed to parse disbursement response: %v", err)
+		}
+		assertExactJSONKeys(t, rawEnvelope, "success", "data")
+
+		var envelope struct {
+			Success bool                     `json:"success"`
+			Data    dto.DisbursementResponse `json:"data"`
+		}
+		if err := json.Unmarshal(response.Body.Bytes(), &envelope); err != nil {
+			t.Fatalf("failed to parse disbursement response: %v", err)
+		}
+		if !envelope.Success {
+			t.Fatal("expected successful disbursement response")
+		}
+		if envelope.Data.ID == uuid.Nil || envelope.Data.CreatedBy != actorID || envelope.Data.RecipientName != "Canonical Recipient" || envelope.Data.AccountNumber != "1234567890" || envelope.Data.BankCode != "BCA" || envelope.Data.Amount != 500000 || envelope.Data.AdminFee != domain.LowerTierAdminFee || envelope.Data.Status != domain.StatusPending || envelope.Data.Note != "Canonical contract" {
+			t.Fatalf("unexpected disbursement response: %+v", envelope.Data)
+		}
+	})
+
+	t.Run("POST /api/v1/auth/login - helper fixture returns usable token", func(t *testing.T) {
+		loginHTTP(t, newAuthHTTPFixture(t))
+	})
+
+	t.Run("POST /api/v1/auth/login - invalid credentials returns exact error envelope", func(t *testing.T) {
+		fixture := newAuthHTTPFixture(t)
+		request := newJSONRequest(t, http.MethodPost, "/api/v1/auth/login", dto.LoginRequest{
 			Username: "local_test_operator",
 			Password: "wrongpassword",
 		})
-		req, _ := http.NewRequest(http.MethodPost, "/auth/login", bytes.NewReader(body))
-		req.Header.Set("Content-Type", "application/json")
-		w := httptest.NewRecorder()
-
-		router.ServeHTTP(w, req)
-
-		if w.Code != http.StatusUnauthorized {
-			t.Fatalf("expected status 401, got %d: %s", w.Code, w.Body.String())
-		}
-
-		var errEnvelope struct {
-			Success bool `json:"success"`
-			Error   struct {
-				Code domain.ErrorCode `json:"code"`
-			} `json:"error"`
-		}
-		json.Unmarshal(w.Body.Bytes(), &errEnvelope)
-		if errEnvelope.Error.Code != domain.CodeInvalidCredentials {
-			t.Errorf("expected INVALID_CREDENTIALS, got %s", errEnvelope.Error.Code)
-		}
+		response := httptest.NewRecorder()
+		fixture.router.ServeHTTP(response, request)
+		assertHTTPError(t, response, http.StatusUnauthorized, domain.CodeInvalidCredentials, "Kredensial tidak valid", nil)
 	})
 
-	t.Run("POST /auth/refresh - valid refresh token", func(t *testing.T) {
-		body, _ := json.Marshal(dto.RefreshRequest{
-			RefreshToken: refreshToken,
-		})
-		req, _ := http.NewRequest(http.MethodPost, "/auth/refresh", bytes.NewReader(body))
-		req.Header.Set("Content-Type", "application/json")
-		w := httptest.NewRecorder()
+	t.Run("POST /api/v1/auth/refresh - rotation rejects old token", func(t *testing.T) {
+		fixture := newAuthHTTPFixture(t)
+		initial := loginHTTP(t, fixture)
+		request := newJSONRequest(t, http.MethodPost, "/api/v1/auth/refresh", dto.RefreshRequest{RefreshToken: initial.RefreshToken})
+		response := httptest.NewRecorder()
+		fixture.router.ServeHTTP(response, request)
+		refreshed := assertTokenSuccessResponse(t, response, initial.RefreshToken)
 
-		router.ServeHTTP(w, req)
+		replacementRequest := newJSONRequest(t, http.MethodPost, "/api/v1/auth/refresh", dto.RefreshRequest{RefreshToken: refreshed.RefreshToken})
+		replacementResponse := httptest.NewRecorder()
+		fixture.router.ServeHTTP(replacementResponse, replacementRequest)
+		assertTokenSuccessResponse(t, replacementResponse, refreshed.RefreshToken)
 
-		if w.Code != http.StatusOK {
-			t.Fatalf("expected status 200, got %d: %s", w.Code, w.Body.String())
-		}
-
-		var responseEnvelope struct {
-			Success bool              `json:"success"`
-			Data    dto.TokenResponse `json:"data"`
-		}
-		json.Unmarshal(w.Body.Bytes(), &responseEnvelope)
-
-		if responseEnvelope.Data.RefreshToken == "" || responseEnvelope.Data.RefreshToken == refreshToken {
-			t.Errorf("expected new rotated refresh token")
-		}
-		refreshToken = responseEnvelope.Data.RefreshToken
+		oldRequest := newJSONRequest(t, http.MethodPost, "/api/v1/auth/refresh", dto.RefreshRequest{RefreshToken: initial.RefreshToken})
+		oldResponse := httptest.NewRecorder()
+		fixture.router.ServeHTTP(oldResponse, oldRequest)
+		assertHTTPError(t, oldResponse, http.StatusUnauthorized, domain.CodeInvalidRefreshToken, "Refresh token tidak valid", nil)
 	})
 
-	t.Run("POST /auth/logout - successful and idempotent", func(t *testing.T) {
-		body, _ := json.Marshal(dto.LogoutRequest{
-			RefreshToken: refreshToken,
-		})
-
-		// First logout
-		req, _ := http.NewRequest(http.MethodPost, "/auth/logout", bytes.NewReader(body))
-		req.Header.Set("Content-Type", "application/json")
-		w := httptest.NewRecorder()
-		router.ServeHTTP(w, req)
-
-		if w.Code != http.StatusNoContent {
-			t.Fatalf("expected status 204, got %d: %s", w.Code, w.Body.String())
+	t.Run("POST /api/v1/auth/logout - idempotent and rejects logged-out token", func(t *testing.T) {
+		fixture := newAuthHTTPFixture(t)
+		tokens := loginHTTP(t, fixture)
+		request := newJSONRequest(t, http.MethodPost, "/api/v1/auth/logout", dto.LogoutRequest{RefreshToken: tokens.RefreshToken})
+		response := httptest.NewRecorder()
+		fixture.router.ServeHTTP(response, request)
+		if response.Code != http.StatusNoContent || response.Body.Len() != 0 {
+			t.Fatalf("expected empty 204 logout response, got %d with body %q", response.Code, response.Body.String())
 		}
 
-		// Second repeated logout (idempotent)
-		req2, _ := http.NewRequest(http.MethodPost, "/auth/logout", bytes.NewReader(body))
-		req2.Header.Set("Content-Type", "application/json")
-		w2 := httptest.NewRecorder()
-		router.ServeHTTP(w2, req2)
-
-		if w2.Code != http.StatusNoContent {
-			t.Fatalf("expected status 204 on repeated logout, got %d: %s", w2.Code, w2.Body.String())
+		repeatedResponse := httptest.NewRecorder()
+		fixture.router.ServeHTTP(repeatedResponse, newJSONRequest(t, http.MethodPost, "/api/v1/auth/logout", dto.LogoutRequest{RefreshToken: tokens.RefreshToken}))
+		if repeatedResponse.Code != http.StatusNoContent || repeatedResponse.Body.Len() != 0 {
+			t.Fatalf("expected empty 204 repeated logout response, got %d with body %q", repeatedResponse.Code, repeatedResponse.Body.String())
 		}
+
+		refreshResponse := httptest.NewRecorder()
+		fixture.router.ServeHTTP(refreshResponse, newJSONRequest(t, http.MethodPost, "/api/v1/auth/refresh", dto.RefreshRequest{RefreshToken: tokens.RefreshToken}))
+		assertHTTPError(t, refreshResponse, http.StatusUnauthorized, domain.CodeInvalidRefreshToken, "Refresh token tidak valid", nil)
 	})
 
-	t.Run("POST /auth/login - malformed JSON and validation failure", func(t *testing.T) {
-		// 1. Malformed JSON
-		req1, _ := http.NewRequest(http.MethodPost, "/auth/login", bytes.NewReader([]byte(`{invalid-json`)))
-		req1.Header.Set("Content-Type", "application/json")
-		w1 := httptest.NewRecorder()
-		router.ServeHTTP(w1, req1)
-		if w1.Code != http.StatusBadRequest {
-			t.Errorf("expected 400 Bad Request for malformed JSON, got %d", w1.Code)
-		}
-
-		// 2. Validation failure (empty username)
-		body, _ := json.Marshal(dto.LoginRequest{Username: "", Password: "password123"})
-		req2, _ := http.NewRequest(http.MethodPost, "/auth/login", bytes.NewReader(body))
-		req2.Header.Set("Content-Type", "application/json")
-		w2 := httptest.NewRecorder()
-		router.ServeHTTP(w2, req2)
-		if w2.Code != http.StatusBadRequest {
-			t.Errorf("expected 400 Bad Request for empty username, got %d", w2.Code)
-		}
-	})
-
-	t.Run("POST /auth/refresh - malformed JSON and validation failure", func(t *testing.T) {
-		req1, _ := http.NewRequest(http.MethodPost, "/auth/refresh", bytes.NewReader([]byte(`{invalid-json`)))
-		req1.Header.Set("Content-Type", "application/json")
-		w1 := httptest.NewRecorder()
-		router.ServeHTTP(w1, req1)
-		if w1.Code != http.StatusBadRequest {
-			t.Errorf("expected 400 Bad Request, got %d", w1.Code)
-		}
-	})
-
-	t.Run("POST /auth/logout - malformed JSON and validation failure", func(t *testing.T) {
-		req1, _ := http.NewRequest(http.MethodPost, "/auth/logout", bytes.NewReader([]byte(`{invalid-json`)))
-		req1.Header.Set("Content-Type", "application/json")
-		w1 := httptest.NewRecorder()
-		router.ServeHTTP(w1, req1)
-		if w1.Code != http.StatusBadRequest {
-			t.Errorf("expected 400 Bad Request, got %d", w1.Code)
+	t.Run("auth endpoints reject malformed JSON with exact error envelope", func(t *testing.T) {
+		fixture := newAuthHTTPFixture(t)
+		for _, path := range []string{"/api/v1/auth/login", "/api/v1/auth/refresh", "/api/v1/auth/logout"} {
+			response := httptest.NewRecorder()
+			fixture.router.ServeHTTP(response, newRawRequest(t, http.MethodPost, path, `{invalid-json`))
+			assertHTTPError(t, response, http.StatusBadRequest, domain.CodeValidationError, "Input tidak valid", []domain.FieldError{{Field: "body", Message: "format JSON tidak valid"}})
 		}
 	})
 
 	t.Run("GET /metrics - authentication token check", func(t *testing.T) {
-		// 1. Missing token header returns 401
-		req1, _ := http.NewRequest(http.MethodGet, "/metrics", nil)
-		w1 := httptest.NewRecorder()
-		router.ServeHTTP(w1, req1)
-		if w1.Code != http.StatusUnauthorized {
-			t.Errorf("expected 401 Unauthorized for metrics without header, got %d", w1.Code)
+		fixture := newAuthHTTPFixture(t)
+		missingRequest := newJSONRequest(t, http.MethodGet, "/metrics", struct{}{})
+		missingRequest.Body = http.NoBody
+		missingResponse := httptest.NewRecorder()
+		fixture.router.ServeHTTP(missingResponse, missingRequest)
+		if missingResponse.Code != http.StatusUnauthorized {
+			t.Fatalf("expected 401 Unauthorized for metrics without header, got %d", missingResponse.Code)
 		}
 
-		// 2. Valid token header returns 200 OK
-		req2, _ := http.NewRequest(http.MethodGet, "/metrics", nil)
-		req2.Header.Set("X-Metrics-Token", "test-metrics-token")
-		w2 := httptest.NewRecorder()
-		router.ServeHTTP(w2, req2)
-		if w2.Code != http.StatusOK {
-			t.Errorf("expected 200 OK for metrics with valid token, got %d", w2.Code)
+		validRequest := newJSONRequest(t, http.MethodGet, "/metrics", struct{}{})
+		validRequest.Body = http.NoBody
+		validRequest.Header.Set("X-Metrics-Token", "test-metrics-token")
+		validResponse := httptest.NewRecorder()
+		fixture.router.ServeHTTP(validResponse, validRequest)
+		if validResponse.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK for metrics with valid token, got %d", validResponse.Code)
 		}
 	})
 }

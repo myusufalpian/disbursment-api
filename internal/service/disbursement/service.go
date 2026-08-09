@@ -140,13 +140,16 @@ func (s *Service) Create(
 		}
 		return CreateResult{}, domain.Internal()
 	case domain.ClaimInProgress:
-		return CreateResult{}, domain.IdempotencyRequestInProgress()
+		return CreateResult{}, domain.IdempotencyRequestInProgressWithRetryAfter(claimResult.RetryAfter)
 	case domain.ClaimReused:
 		return CreateResult{}, domain.IdempotencyKeyReused()
 	}
 
 	// Perform creation within transaction and complete idempotency claim
 	err = s.transactor.WithinTransaction(ctx, func(ctx context.Context, tx repository.Transaction) error {
+		if err := s.coordinator.VerifyOwnership(ctx, tx, scope, claimResult.ClaimID); err != nil {
+			return err
+		}
 		if err := s.disbursementStore.Insert(ctx, tx, disbursement); err != nil {
 			return err
 		}

@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -11,6 +12,13 @@ import (
 	"github.com/google/uuid"
 	"github.com/jmoiron/sqlx"
 )
+
+func nullableJSON(value json.RawMessage) any {
+	if len(value) == 0 {
+		return nil
+	}
+	return string(value)
+}
 
 const (
 	insertAuditOutboxEvent = `
@@ -70,6 +78,7 @@ type auditOutboxRow struct {
 type AuditOutboxStore struct {
 	database      *sqlx.DB
 	leaseDuration time.Duration
+	now           func() time.Time
 }
 
 func NewAuditOutboxStore(database *sqlx.DB) *AuditOutboxStore {
@@ -83,6 +92,7 @@ func NewAuditOutboxStoreWithLease(database *sqlx.DB, leaseDuration time.Duration
 	return &AuditOutboxStore{
 		database:      database,
 		leaseDuration: leaseDuration,
+		now:           func() time.Time { return time.Now().UTC() },
 	}
 }
 
@@ -103,8 +113,8 @@ func (store *AuditOutboxStore) Insert(ctx context.Context, transaction repositor
 		event.Action,
 		event.ActorID,
 		event.RequestID,
-		event.BeforeData,
-		event.AfterData,
+		nullableJSON(event.BeforeData),
+		nullableJSON(event.AfterData),
 		event.OccurredAt,
 	)
 	if err != nil {
@@ -131,7 +141,7 @@ func (store *AuditOutboxStore) FetchPending(ctx context.Context, limit int) ([]d
 	if leaseTTL <= 0 {
 		leaseTTL = 5 * time.Minute
 	}
-	now := time.Now().UTC()
+	now := store.now()
 	leaseUntil := now.Add(leaseTTL)
 	var rows []auditOutboxRow
 	err := store.database.SelectContext(ctx, &rows, fetchPendingOutboxEvents, leaseUntil, now, limit)
@@ -163,7 +173,7 @@ func (store *AuditOutboxStore) MarkDelivered(ctx context.Context, eventID uuid.U
 		return repository.NewError(repository.ErrorConstraint, fmt.Errorf("event ID required"))
 	}
 	if deliveredAt.IsZero() {
-		deliveredAt = time.Now().UTC()
+		deliveredAt = store.now()
 	}
 	_, err := store.database.ExecContext(ctx, markOutboxDelivered, eventID, deliveredAt.UTC())
 	if err != nil {
@@ -196,7 +206,7 @@ func (store *AuditOutboxStore) ReconcilePending(ctx context.Context, minAge time
 	if minAge <= 0 {
 		minAge = 5 * time.Minute
 	}
-	now := time.Now().UTC()
+	now := store.now()
 	warningThreshold := now.Add(-minAge)
 	criticalThreshold := now.Add(-3 * minAge)
 
@@ -215,7 +225,7 @@ func (store *AuditOutboxStore) CleanupDelivered(ctx context.Context, olderThan t
 	if olderThan <= 0 {
 		olderThan = 30 * 24 * time.Hour
 	}
-	cutoff := time.Now().UTC().Add(-olderThan)
+	cutoff := store.now().Add(-olderThan)
 	res, err := store.database.ExecContext(ctx, cleanupDeliveredOutbox, cutoff)
 	if err != nil {
 		return 0, repository.Classify(err)

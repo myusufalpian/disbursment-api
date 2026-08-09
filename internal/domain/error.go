@@ -1,6 +1,9 @@
 package domain
 
-import "errors"
+import (
+	"errors"
+	"time"
+)
 
 type ErrorCode string
 
@@ -26,10 +29,11 @@ type FieldError struct {
 }
 
 type Error struct {
-	Code    ErrorCode
-	Message string
-	Status  int
-	Details []FieldError
+	Code       ErrorCode
+	Message    string
+	Status     int
+	Details    []FieldError
+	RetryAfter time.Duration
 }
 
 func (e *Error) Error() string {
@@ -131,6 +135,12 @@ func IdempotencyRequestInProgress() *Error {
 		Message: "Request dengan idempotency key yang sama sedang diproses",
 		Status:  409,
 	}
+}
+
+func IdempotencyRequestInProgressWithRetryAfter(retryAfter time.Duration) *Error {
+	err := IdempotencyRequestInProgress()
+	err.RetryAfter = retryAfter
+	return err
 }
 
 func AsError(err error) *Error {

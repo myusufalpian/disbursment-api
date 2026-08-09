@@ -1,6 +1,8 @@
 package metrics
 
 import (
+	"encoding/json"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -10,9 +12,9 @@ import (
 
 func TestMetricsCollector_FullCoverage(t *testing.T) {
 	gin.SetMode(gin.TestMode)
-	collector := NewMetricsCollector()
 
 	t.Run("RecordHTTPRequest and Snapshot", func(t *testing.T) {
+		collector := NewMetricsCollector()
 		collector.RecordHTTPRequest("POST", "/disbursements", 201, 45)
 		collector.RecordHTTPRequest("POST", "/disbursements", 201, 55)
 		collector.RecordHTTPRequest("GET", "/disbursements", 404, 10)
@@ -21,15 +23,20 @@ func TestMetricsCollector_FullCoverage(t *testing.T) {
 		if snapshot.HTTPRequestsCount != 3 {
 			t.Fatalf("expected 3 requests count, got %d", snapshot.HTTPRequestsCount)
 		}
-		if snapshot.HTTPDurationMsAverage != 36.666666666666664 && (snapshot.HTTPDurationMsAverage < 36.0 || snapshot.HTTPDurationMsAverage > 37.0) {
-			t.Fatalf("unexpected average duration: %f", snapshot.HTTPDurationMsAverage)
+		expectedAverage := 110.0 / 3.0
+		if math.Abs(snapshot.HTTPDurationMsAverage-expectedAverage) > 1e-9 {
+			t.Fatalf("expected average duration %f, got %f", expectedAverage, snapshot.HTTPDurationMsAverage)
 		}
 		if snapshot.HTTPRequestsTotal["POST /disbursements 2xx"] != 2 {
 			t.Fatalf("expected 2 POST requests 2xx, got %d", snapshot.HTTPRequestsTotal["POST /disbursements 2xx"])
 		}
+		if snapshot.HTTPRequestsTotal["GET /disbursements 4xx"] != 1 {
+			t.Fatalf("expected 1 GET request 4xx, got %d", snapshot.HTTPRequestsTotal["GET /disbursements 4xx"])
+		}
 	})
 
 	t.Run("RecordHTTPRequest normalizes UUID in path", func(t *testing.T) {
+		collector := NewMetricsCollector()
 		collector.RecordHTTPRequest("GET", "/disbursements/123e4567-e89b-12d3-a456-426614174000/status", 200, 15)
 		collector.RecordHTTPRequest("GET", "/disbursements/98765432-e89b-12d3-a456-426614174999/status", 200, 25)
 
@@ -40,21 +47,41 @@ func TestMetricsCollector_FullCoverage(t *testing.T) {
 	})
 
 	t.Run("RecordIdempotencyClaim and Finalization", func(t *testing.T) {
+		collector := NewMetricsCollector()
 		collector.RecordIdempotencyClaim("acquired")
 		collector.RecordIdempotencyClaim("replayed")
 		collector.RecordFinalizationOutcome("approved")
 		collector.RecordFinalizationOutcome("conflict")
 
 		snapshot := collector.Snapshot()
+		if len(snapshot.IdempotencyClaimsTotal) != 2 {
+			t.Fatalf("expected exactly 2 idempotency claim labels, got %v", snapshot.IdempotencyClaimsTotal)
+		}
 		if snapshot.IdempotencyClaimsTotal["acquired"] != 1 {
 			t.Fatalf("expected 1 acquired claim")
+		}
+		if snapshot.IdempotencyClaimsTotal["replayed"] != 1 {
+			t.Fatalf("expected 1 replayed claim")
+		}
+		if snapshot.IdempotencyClaimsTotal["missing"] != 0 {
+			t.Fatalf("expected absent idempotency claim label to remain zero")
+		}
+		if len(snapshot.FinalizationsTotal) != 2 {
+			t.Fatalf("expected exactly 2 finalization labels, got %v", snapshot.FinalizationsTotal)
 		}
 		if snapshot.FinalizationsTotal["approved"] != 1 {
 			t.Fatalf("expected 1 approved finalization")
 		}
+		if snapshot.FinalizationsTotal["conflict"] != 1 {
+			t.Fatalf("expected 1 conflict finalization")
+		}
+		if snapshot.FinalizationsTotal["missing"] != 0 {
+			t.Fatalf("expected absent finalization label to remain zero")
+		}
 	})
 
 	t.Run("RecordAuthFailure, Delivery, Backlog, Reconciliation, DBStats", func(t *testing.T) {
+		collector := NewMetricsCollector()
 		collector.RecordAuthFailure("invalid_credentials")
 		collector.RecordDeliverySuccess()
 		collector.RecordDeliveryFailure()
@@ -81,6 +108,7 @@ func TestMetricsCollector_FullCoverage(t *testing.T) {
 	})
 
 	t.Run("HTTPHandler endpoint", func(t *testing.T) {
+		collector := NewMetricsCollector()
 		router := gin.New()
 		router.GET("/metrics", collector.HTTPHandler(""))
 
@@ -95,6 +123,7 @@ func TestMetricsCollector_FullCoverage(t *testing.T) {
 	})
 
 	t.Run("HTTPHandler with token validation", func(t *testing.T) {
+		collector := NewMetricsCollector()
 		router := gin.New()
 		router.GET("/metrics", collector.HTTPHandler("sec-token-123"))
 
@@ -122,4 +151,131 @@ func TestMetricsCollector_FullCoverage(t *testing.T) {
 			t.Fatalf("expected non-nil default collector")
 		}
 	})
+}
+
+func TestMetricsCollectorHTTPHandlerContract(t *testing.T) {
+	const expectedNoStore = "no-store, no-cache, must-revalidate"
+	const expectedJSON = "application/json; charset=utf-8"
+
+	t.Run("unconfigured token returns exact error response", func(t *testing.T) {
+		router := gin.New()
+		router.GET("/metrics", NewMetricsCollector().HTTPHandler(""))
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+
+		if response.Code != http.StatusServiceUnavailable {
+			t.Fatalf("expected 503 Service Unavailable, got %d", response.Code)
+		}
+		if response.Header().Get("Cache-Control") != expectedNoStore {
+			t.Fatalf("expected no-store cache policy, got %q", response.Header().Get("Cache-Control"))
+		}
+		if response.Header().Get("Content-Type") != expectedJSON {
+			t.Fatalf("expected exact JSON content type, got %q", response.Header().Get("Content-Type"))
+		}
+		var body map[string]json.RawMessage
+		if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+			t.Fatalf("decode unconfigured response: %v", err)
+		}
+		if len(body) != 1 || string(body["error"]) != `"metrics authentication is not configured"` {
+			t.Fatalf("unexpected unconfigured response body: %s", response.Body.String())
+		}
+	})
+
+	t.Run("missing token returns exact error response", func(t *testing.T) {
+		testMetricsUnauthorizedResponse(t, expectedNoStore, expectedJSON, "")
+	})
+
+	t.Run("wrong token returns exact error response", func(t *testing.T) {
+		testMetricsUnauthorizedResponse(t, expectedNoStore, expectedJSON, "wrong-token")
+	})
+
+	t.Run("valid token returns exact snapshot response", func(t *testing.T) {
+		collector := NewMetricsCollector()
+		collector.RecordHTTPRequest("GET", "/api/v1/disbursements", http.StatusOK, 10)
+		router := gin.New()
+		router.GET("/metrics", collector.HTTPHandler("sec-token-123"))
+		request := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+		request.Header.Set("X-Metrics-Token", "sec-token-123")
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+
+		if response.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK, got %d", response.Code)
+		}
+		if response.Header().Get("Cache-Control") != expectedNoStore {
+			t.Fatalf("expected no-store cache policy, got %q", response.Header().Get("Cache-Control"))
+		}
+		if response.Header().Get("Content-Type") != expectedJSON {
+			t.Fatalf("expected exact JSON content type, got %q", response.Header().Get("Content-Type"))
+		}
+		var body map[string]json.RawMessage
+		if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+			t.Fatalf("decode valid response: %v", err)
+		}
+		assertMetricsJSONKeys(t, body,
+			"http_requests_total",
+			"http_duration_ms_average",
+			"http_requests_count",
+			"idempotency_claims_total",
+			"finalizations_total",
+			"auth_failures_total",
+			"outbox_backlog_depth",
+			"outbox_deliveries_total",
+			"outbox_delivery_failures_total",
+			"outbox_reconcile_warning_count",
+			"outbox_reconcile_critical_count",
+			"db_connections_open",
+			"db_connections_in_use",
+			"db_connections_idle",
+		)
+		var snapshot MetricsSnapshot
+		if err := json.Unmarshal(response.Body.Bytes(), &snapshot); err != nil {
+			t.Fatalf("decode metrics snapshot: %v", err)
+		}
+		if snapshot.HTTPRequestsCount != 1 || snapshot.HTTPRequestsTotal["GET /api/v1/disbursements 2xx"] != 1 {
+			t.Fatalf("unexpected metrics snapshot values: %+v", snapshot)
+		}
+	})
+}
+
+func testMetricsUnauthorizedResponse(t *testing.T, expectedNoStore string, expectedJSON string, token string) {
+	t.Helper()
+	collector := NewMetricsCollector()
+	router := gin.New()
+	router.GET("/metrics", collector.HTTPHandler("sec-token-123"))
+	request := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	if token != "" {
+		request.Header.Set("X-Metrics-Token", token)
+	}
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 Unauthorized, got %d", response.Code)
+	}
+	if response.Header().Get("Cache-Control") != expectedNoStore {
+		t.Fatalf("expected no-store cache policy, got %q", response.Header().Get("Cache-Control"))
+	}
+	if response.Header().Get("Content-Type") != expectedJSON {
+		t.Fatalf("expected exact JSON content type, got %q", response.Header().Get("Content-Type"))
+	}
+	var body map[string]json.RawMessage
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode unauthorized response: %v", err)
+	}
+	if len(body) != 1 || string(body["error"]) != `"unauthorized metrics access"` {
+		t.Fatalf("unexpected unauthorized response body: %s", response.Body.String())
+	}
+}
+
+func assertMetricsJSONKeys(t *testing.T, body map[string]json.RawMessage, expected ...string) {
+	t.Helper()
+	if len(body) != len(expected) {
+		t.Fatalf("expected JSON keys %v, got %v", expected, body)
+	}
+	for _, key := range expected {
+		if _, ok := body[key]; !ok {
+			t.Fatalf("expected JSON key %q in %v", key, body)
+		}
+	}
 }

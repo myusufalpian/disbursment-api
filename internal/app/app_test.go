@@ -10,15 +10,52 @@ import (
 	"time"
 
 	"disbursment-api/internal/config"
+	"disbursment-api/internal/domain"
 	"disbursment-api/internal/httpapi"
 	"disbursment-api/internal/observability/metrics"
+	"disbursment-api/internal/repository"
 	"disbursment-api/internal/repository/postgres"
 	"disbursment-api/internal/service/audit"
 	"disbursment-api/internal/service/idempotency"
 
 	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/google/uuid"
 	"github.com/jmoiron/sqlx"
 )
+
+type lifecycleRelayStore struct{}
+
+func (lifecycleRelayStore) Insert(context.Context, repository.Transaction, domain.AuditEvent) error {
+	return nil
+}
+
+func (lifecycleRelayStore) FetchPending(context.Context, int) ([]domain.AuditEvent, error) {
+	return nil, nil
+}
+
+func (lifecycleRelayStore) MarkDelivered(context.Context, uuid.UUID, time.Time) error {
+	return nil
+}
+
+func (lifecycleRelayStore) RecordFailure(context.Context, uuid.UUID, string, time.Time) error {
+	return nil
+}
+
+func (lifecycleRelayStore) ReconcilePending(context.Context, time.Duration) (int, int, error) {
+	return 0, 0, nil
+}
+
+func (lifecycleRelayStore) CleanupDelivered(context.Context, time.Duration) (int64, error) {
+	return 0, nil
+}
+
+func (lifecycleRelayStore) InsertProjection(context.Context, repository.Transaction, domain.AuditEvent) error {
+	return nil
+}
+
+func (lifecycleRelayStore) FindLogBySourceEventID(context.Context, uuid.UUID) (*domain.AuditEvent, error) {
+	return nil, nil
+}
 
 func TestApplicationLifecycleRunAndShutdown(t *testing.T) {
 	db, _, err := sqlmock.New()
@@ -36,11 +73,10 @@ func TestApplicationLifecycleRunAndShutdown(t *testing.T) {
 	_ = listener.Close()
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	outboxStore := postgres.NewAuditOutboxStore(sqlxDB)
-	projectionStore := postgres.NewAuditProjectionStore(sqlxDB)
+	relayStore := lifecycleRelayStore{}
 	collector := metrics.NewMetricsCollector()
 
-	relayService, err := audit.NewRelayService(outboxStore, projectionStore, collector, logger)
+	relayService, err := audit.NewRelayService(&relayStore, &relayStore, collector, logger)
 	if err != nil {
 		t.Fatalf("failed to create relay service: %v", err)
 	}
@@ -71,13 +107,26 @@ func TestApplicationLifecycleRunAndShutdown(t *testing.T) {
 		runErrChan <- app.Run(ctx)
 	}()
 
-	// Wait briefly for server to start
-	time.Sleep(50 * time.Millisecond)
+	// Poll for the server readiness condition instead of sleeping for a fixed duration.
+	readinessDeadline := time.NewTimer(2 * time.Second)
+	defer readinessDeadline.Stop()
+	readinessTicker := time.NewTicker(5 * time.Millisecond)
+	defer readinessTicker.Stop()
 
-	// Send HTTP request to verify HTTP server is running
-	resp, err := http.Get("http://" + addr + "/health")
-	if err != nil {
-		t.Fatalf("HTTP request to /health failed: %v", err)
+	var resp *http.Response
+	for {
+		resp, err = http.Get("http://" + addr + "/health")
+		if err == nil && resp.StatusCode == http.StatusOK {
+			break
+		}
+		if resp != nil {
+			_ = resp.Body.Close()
+		}
+		select {
+		case <-readinessTicker.C:
+		case <-readinessDeadline.C:
+			t.Fatalf("HTTP server did not become ready: %v", err)
+		}
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {

@@ -19,9 +19,16 @@ func TestAuditOutboxStore_InsertAndRelayMethods(t *testing.T) {
 		t.Fatalf("failed to open sqlmock: %v", err)
 	}
 	defer db.Close()
+	t.Cleanup(func() {
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("sqlmock expectations: %v", err)
+		}
+	})
 
 	sqlxDB := sqlx.NewDb(db, "sqlmock")
 	store := NewAuditOutboxStore(sqlxDB)
+	now := time.Date(2026, time.August, 9, 12, 0, 0, 0, time.UTC)
+	store.now = func() time.Time { return now }
 
 	event := domain.AuditEvent{
 		EventID:    uuid.New(),
@@ -32,16 +39,16 @@ func TestAuditOutboxStore_InsertAndRelayMethods(t *testing.T) {
 		RequestID:  uuid.New(),
 		BeforeData: []byte(`null`),
 		AfterData:  []byte(`{"amount":100000}`),
-		OccurredAt: time.Now().UTC(),
+		OccurredAt: now,
 	}
 
 	t.Run("Insert outbox event success", func(t *testing.T) {
 		mock.ExpectBegin()
 		mock.ExpectExec("^INSERT INTO audit_outbox").
-			WithArgs(event.EventID, event.EntityType, event.EntityID, event.Action, event.ActorID, event.RequestID, event.BeforeData, event.AfterData, event.OccurredAt).
+			WithArgs(event.EventID, event.EntityType, event.EntityID, event.Action, event.ActorID, event.RequestID, string(event.BeforeData), string(event.AfterData), event.OccurredAt).
 			WillReturnResult(sqlmock.NewResult(1, 1))
 
-		tx, _ := sqlxDB.BeginTxx(context.Background(), nil)
+		tx := beginSQLMockTx(t, mock, sqlxDB)
 		err := store.Insert(context.Background(), newTestTx(tx), event)
 		if err != nil {
 			t.Fatalf("Insert outbox failed: %v", err)
@@ -50,8 +57,7 @@ func TestAuditOutboxStore_InsertAndRelayMethods(t *testing.T) {
 
 	t.Run("Insert outbox event invalid event", func(t *testing.T) {
 		invalidEvent := domain.AuditEvent{}
-		tx, _ := sqlxDB.BeginTxx(context.Background(), nil)
-		err := store.Insert(context.Background(), newTestTx(tx), invalidEvent)
+		err := store.Insert(context.Background(), nil, invalidEvent)
 		if err == nil {
 			t.Fatalf("expected error for invalid event")
 		}
@@ -62,7 +68,7 @@ func TestAuditOutboxStore_InsertAndRelayMethods(t *testing.T) {
 		mock.ExpectExec("^INSERT INTO audit_outbox").
 			WillReturnError(errors.New("db insert failure"))
 
-		tx, _ := sqlxDB.BeginTxx(context.Background(), nil)
+		tx := beginSQLMockTx(t, mock, sqlxDB)
 		err := store.Insert(context.Background(), newTestTx(tx), event)
 		if err == nil {
 			t.Fatalf("expected error for db insert failure")
@@ -71,10 +77,10 @@ func TestAuditOutboxStore_InsertAndRelayMethods(t *testing.T) {
 
 	t.Run("FetchPending success", func(t *testing.T) {
 		rows := sqlmock.NewRows([]string{"event_id", "entity_type", "entity_id", "action", "actor_id", "request_id", "before_data", "after_data", "occurred_at"}).
-			AddRow(event.EventID, event.EntityType, event.EntityID, event.Action, event.ActorID, event.RequestID, event.BeforeData, event.AfterData, event.OccurredAt)
+			AddRow(event.EventID, event.EntityType, event.EntityID, event.Action, event.ActorID, event.RequestID, string(event.BeforeData), string(event.AfterData), event.OccurredAt)
 
 		mock.ExpectQuery("^UPDATE audit_outbox SET available_at =").
-			WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), 50).
+			WithArgs(now.Add(5*time.Minute), now, 50).
 			WillReturnRows(rows)
 
 		fetched, err := store.FetchPending(context.Background(), 0)
@@ -87,22 +93,24 @@ func TestAuditOutboxStore_InsertAndRelayMethods(t *testing.T) {
 	})
 
 	t.Run("MarkDelivered success", func(t *testing.T) {
+		deliveredAt := now.Add(time.Hour)
 		mock.ExpectExec("^UPDATE audit_outbox SET delivery_state = 'DELIVERED'").
-			WithArgs(event.EventID, sqlmock.AnyArg()).
+			WithArgs(event.EventID, deliveredAt).
 			WillReturnResult(sqlmock.NewResult(1, 1))
 
-		err := store.MarkDelivered(context.Background(), event.EventID, time.Now().UTC())
+		err := store.MarkDelivered(context.Background(), event.EventID, deliveredAt)
 		if err != nil {
 			t.Fatalf("MarkDelivered failed: %v", err)
 		}
 	})
 
 	t.Run("RecordFailure success", func(t *testing.T) {
+		nextAvailableAt := now.Add(2 * time.Minute)
 		mock.ExpectExec("^UPDATE audit_outbox SET delivery_attempts = delivery_attempts \\+ 1").
-			WithArgs(event.EventID, "connection timeout", sqlmock.AnyArg()).
+			WithArgs(event.EventID, "connection timeout", nextAvailableAt).
 			WillReturnResult(sqlmock.NewResult(1, 1))
 
-		err := store.RecordFailure(context.Background(), event.EventID, "connection timeout", time.Now().UTC())
+		err := store.RecordFailure(context.Background(), event.EventID, "connection timeout", nextAvailableAt)
 		if err != nil {
 			t.Fatalf("RecordFailure failed: %v", err)
 		}
@@ -111,7 +119,7 @@ func TestAuditOutboxStore_InsertAndRelayMethods(t *testing.T) {
 	t.Run("ReconcilePending success", func(t *testing.T) {
 		rows := sqlmock.NewRows([]string{"warning_count", "critical_count"}).AddRow(2, 1)
 		mock.ExpectQuery("^SELECT COALESCE").
-			WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg()).
+			WithArgs(now.Add(-5*time.Minute), now.Add(-15*time.Minute)).
 			WillReturnRows(rows)
 
 		warn, crit, err := store.ReconcilePending(context.Background(), 5*time.Minute)
@@ -125,7 +133,7 @@ func TestAuditOutboxStore_InsertAndRelayMethods(t *testing.T) {
 
 	t.Run("CleanupDelivered success", func(t *testing.T) {
 		mock.ExpectExec("^DELETE FROM audit_outbox WHERE delivery_state = 'DELIVERED'").
-			WithArgs(sqlmock.AnyArg()).
+			WithArgs(now.Add(-30 * 24 * time.Hour)).
 			WillReturnResult(sqlmock.NewResult(0, 5))
 
 		cleaned, err := store.CleanupDelivered(context.Background(), 30*24*time.Hour)

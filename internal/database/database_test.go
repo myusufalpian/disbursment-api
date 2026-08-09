@@ -2,12 +2,11 @@ package database
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
 	"disbursment-api/internal/config"
-
-	"github.com/DATA-DOG/go-sqlmock"
 )
 
 func TestOpen(t *testing.T) {
@@ -29,31 +28,11 @@ func TestOpen(t *testing.T) {
 			}
 			t.Fatalf("expected error for pinging invalid database DSN, got nil")
 		}
-	})
-
-	t.Run("Open with sqlmock ping failure", func(t *testing.T) {
-		db, mock, err := sqlmock.New(sqlmock.MonitorPingsOption(true))
-		if err != nil {
-			t.Fatalf("failed to create sqlmock: %v", err)
+		if !strings.Contains(err.Error(), "ping database:") {
+			t.Fatalf("expected error message to contain 'ping database:', got: %v", err)
 		}
-		defer db.Close()
-
-		mock.ExpectPing().WillReturnError(sqlmock.ErrCancelled)
-
-		cfg := config.DatabaseConfig{
-			URL:                   "postgres://user:pass@localhost:5432/db?sslmode=disable",
-			MaxOpenConnections:    5,
-			MaxIdleConnections:    2,
-			ConnectionMaxLifetime: 1 * time.Minute,
-		}
-
-		ctx := context.Background()
-		result, err := Open(ctx, cfg)
-		if err == nil {
-			if result != nil {
-				_ = result.Close()
-			}
-			t.Fatalf("expected ping error, got nil")
+		if strings.Contains(err.Error(), "<nil>") {
+			t.Fatalf("error message contains unexpected nil format: %v", err)
 		}
 	})
 }

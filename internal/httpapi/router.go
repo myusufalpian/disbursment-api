@@ -38,8 +38,8 @@ func NewRouter(
 	}
 	router.Use(
 		middleware.RequestID(),
-		middleware.Recovery(logger),
 		middleware.AccessLog(logger, metricsCollector),
+		middleware.Recovery(logger),
 		middleware.BodyLimit(maxRequestBodyBytes),
 	)
 
