@@ -27,6 +27,8 @@ const (
 	defaultAuditWarningAge         = 5 * time.Minute
 	defaultAuditCriticalAge        = 15 * time.Minute
 	defaultAuditReconciliation     = 15 * time.Minute
+	defaultAuditOutboxBatchSize    = 50
+	defaultAuditRelayInterval      = 5 * time.Second
 	defaultMaxRequestBodyBytes     = 1 << 20
 )
 
@@ -58,6 +60,8 @@ type DatabaseConfig struct {
 
 type SecurityConfig struct {
 	JWTSecret       string
+	JWTKeyID        string
+	JWTLegacyKeys   map[string]string
 	JWTIssuer       string
 	JWTAudience     string
 	AccessTokenTTL  time.Duration
@@ -74,6 +78,8 @@ type AuditConfig struct {
 	WarningAge             time.Duration
 	CriticalAge            time.Duration
 	ReconciliationInterval time.Duration
+	OutboxBatchSize        int
+	RelayInterval          time.Duration
 }
 
 func Load() (Config, error) {
@@ -91,11 +97,28 @@ func Load() (Config, error) {
 	}
 
 	var trustedProxies []string
-	if rawProxies := stringValue("HTTP_TRUSTED_PROXIES", ""); rawProxies != "" {
+	rawProxies := stringValue("HTTP_TRUSTED_PROXIES", stringValue("TRUSTED_PROXIES", ""))
+	if rawProxies != "" {
 		for _, p := range strings.Split(rawProxies, ",") {
 			if trimmed := strings.TrimSpace(p); trimmed != "" {
 				trustedProxies = append(trustedProxies, trimmed)
 			}
+		}
+	}
+
+	activeKeyID := stringValue("JWT_KEY_ID", "v1")
+
+	legacyKeys := make(map[string]string)
+	if rawLegacy := stringValue("JWT_LEGACY_KEYS", ""); rawLegacy != "" {
+		for _, pair := range strings.Split(rawLegacy, ",") {
+			parts := strings.SplitN(strings.TrimSpace(pair), ":", 2)
+			if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+				return Config{}, fmt.Errorf("JWT_LEGACY_KEYS contains malformed pair: %q", pair)
+			}
+			if parts[0] == activeKeyID {
+				return Config{}, fmt.Errorf("JWT_LEGACY_KEYS contains active key ID %q", activeKeyID)
+			}
+			legacyKeys[parts[0]] = parts[1]
 		}
 	}
 
@@ -107,9 +130,11 @@ func Load() (Config, error) {
 		},
 		Database: DatabaseConfig{URL: databaseURL},
 		Security: SecurityConfig{
-			JWTSecret:   jwtSecret,
-			JWTIssuer:   stringValue("JWT_ISSUER", "disbursement-api"),
-			JWTAudience: stringValue("JWT_AUDIENCE", "disbursement-api-users"),
+			JWTSecret:     jwtSecret,
+			JWTKeyID:      activeKeyID,
+			JWTLegacyKeys: legacyKeys,
+			JWTIssuer:     stringValue("JWT_ISSUER", "disbursement-api"),
+			JWTAudience:   stringValue("JWT_AUDIENCE", "disbursement-api-users"),
 		},
 	}
 	if config.HTTP.ReadTimeout, err = readDuration("HTTP_READ_TIMEOUT", defaultHTTPReadTimeout); err != nil {
@@ -158,6 +183,12 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	if config.Audit.ReconciliationInterval, err = readDuration("AUDIT_RECONCILIATION_INTERVAL", defaultAuditReconciliation); err != nil {
+		return Config{}, err
+	}
+	if config.Audit.OutboxBatchSize, err = readInt("AUDIT_OUTBOX_BATCH_SIZE", defaultAuditOutboxBatchSize, 1); err != nil {
+		return Config{}, err
+	}
+	if config.Audit.RelayInterval, err = readDuration("AUDIT_RELAY_INTERVAL", defaultAuditRelayInterval); err != nil {
 		return Config{}, err
 	}
 	if err := config.validate(); err != nil {
@@ -213,6 +244,23 @@ func DatabaseURL() (string, error) {
 		return "", fmt.Errorf("DATABASE_URL must be a valid PostgreSQL URL")
 	}
 	return rawURL, nil
+}
+
+const MinimumSecretLength = 32
+
+func (c Config) ValidateSecretStrength() error {
+	if len(c.Security.JWTSecret) < MinimumSecretLength {
+		return fmt.Errorf("JWT_SECRET must be at least %d characters", MinimumSecretLength)
+	}
+	for keyID, secret := range c.Security.JWTLegacyKeys {
+		if len(secret) < MinimumSecretLength {
+			return fmt.Errorf("JWT_LEGACY_KEYS secret for key ID %q must be at least %d characters", keyID, MinimumSecretLength)
+		}
+	}
+	if len(c.HTTP.MetricsToken) < MinimumSecretLength {
+		return fmt.Errorf("METRICS_TOKEN must be at least %d characters", MinimumSecretLength)
+	}
+	return nil
 }
 
 func (c Config) validate() error {

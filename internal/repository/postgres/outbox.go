@@ -63,6 +63,12 @@ DELETE FROM audit_outbox
 WHERE delivery_state = 'DELIVERED' AND delivered_at < $1`
 )
 
+const (
+	fallbackReconcileWarningAge         = 5 * time.Minute
+	fallbackReconcileCriticalMultiplier = 3
+	fallbackCleanupDeliveredRetention   = 30 * 24 * time.Hour
+)
+
 type auditOutboxRow struct {
 	EventID    uuid.UUID `db:"event_id"`
 	EntityType string    `db:"entity_type"`
@@ -199,16 +205,19 @@ func (store *AuditOutboxStore) RecordFailure(ctx context.Context, eventID uuid.U
 	return nil
 }
 
-func (store *AuditOutboxStore) ReconcilePending(ctx context.Context, minAge time.Duration) (int, int, error) {
+func (store *AuditOutboxStore) ReconcilePending(ctx context.Context, minAge time.Duration, criticalAge time.Duration) (int, int, error) {
 	if store.database == nil {
 		return 0, 0, repository.NewError(repository.ErrorDependency, fmt.Errorf("database connection required"))
 	}
 	if minAge <= 0 {
-		minAge = 5 * time.Minute
+		minAge = fallbackReconcileWarningAge
+	}
+	if criticalAge <= minAge {
+		criticalAge = fallbackReconcileCriticalMultiplier * minAge
 	}
 	now := store.now()
 	warningThreshold := now.Add(-minAge)
-	criticalThreshold := now.Add(-3 * minAge)
+	criticalThreshold := now.Add(-criticalAge)
 
 	var warningCount, criticalCount int
 	row := store.database.QueryRowContext(ctx, reconcileOutboxPending, warningThreshold, criticalThreshold)
@@ -223,7 +232,7 @@ func (store *AuditOutboxStore) CleanupDelivered(ctx context.Context, olderThan t
 		return 0, repository.NewError(repository.ErrorDependency, fmt.Errorf("database connection required"))
 	}
 	if olderThan <= 0 {
-		olderThan = 30 * 24 * time.Hour
+		olderThan = fallbackCleanupDeliveredRetention
 	}
 	cutoff := store.now().Add(-olderThan)
 	res, err := store.database.ExecContext(ctx, cleanupDeliveredOutbox, cutoff)

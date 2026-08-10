@@ -33,7 +33,7 @@ Detailed architectural decision records and system design choices are documented
 - **Stateless Bearer JWT Authentication:** Issues access JWTs signed with HMAC-SHA256 (`JWT_SECRET`) carrying `sub`, `username`, `role`, `iss`, `aud`, `iat`, and `exp` (15m TTL). Middleware explicitly verifies HMAC signing (`*jwt.SigningMethodHMAC`) and validates mandatory `iss` and `aud` claims to prevent `none` algorithm & key-confusion attacks.
 - **PostgreSQL-Backed Refresh Rotation:** Cryptographic UUID v4 refresh tokens are stored solely as SHA-256 hashes (`token_hash`). Plaintext tokens are never persisted or logged. `POST /auth/refresh` executes atomic session rotation (`revoked_at = now()`, `replaced_by_id = new_session.id`) and new session insertion in a single PostgreSQL transaction.
 - **Single-Winner Race Protection:** PostgreSQL row-level locks and `UPDATE ... WHERE token_hash = $1 AND revoked_at IS NULL AND expires_at > $1` ensure N concurrent refresh requests produce exactly one winner (`RowsAffected == 1`). All concurrent losers or reused tokens receive `401 INVALID_REFRESH_TOKEN`.
-- **IP Rate Limiting:** `/auth/login` and `/auth/refresh` are protected by an in-memory IP rate limiter (max 10 requests/minute per IP). Exceeded requests return `429 TOO_MANY_REQUESTS` with `Retry-After: 60`.
+- **IP Rate Limiting:** `/auth/login` and `/auth/refresh` are protected by an in-memory IP rate limiter (max 10 requests/minute per IP). This rate limiter is **per-instance** (not distributed via Redis). When scaling out to N replicas, the effective limit becomes `10 * N` requests per minute across the cluster. Exceeded requests return `429 TOO_MANY_REQUESTS` with `Retry-After: 60`.
 - **Idempotent Logout:** `POST /auth/logout` atomically revokes refresh sessions. Repeated logouts return `204 No Content` without error.
 - **Role-Based Access Control (RBAC):** `RequireRole` middleware enforces role boundaries (`OPERATOR`, `ADMIN`, `SUPERADMIN`), returning `403 FORBIDDEN` when permissions are insufficient.
 
@@ -60,8 +60,14 @@ Detailed architectural decision records and system design choices are documented
 
 ### 5. Integration Release Gates & Contract Verification (`internal/integration` & `internal/httpapi`)
 - **PostgreSQL Release Gate Harness (`internal/integration/postgres_release_gate_test.go`):** Validates full schema migration roll-up/tear-down (`UpDownUp`), single-winner idempotency claim acquisition under parallel goroutines, single disbursement creation & outbox event insertion under N-way concurrent requests, atomic finalization status locking, and atomic refresh token rotation on real PostgreSQL.
+- **HTTP Release Contract Suite (`internal/httpapi/release_contract_test.go`):** Verifies RFC 7807 problem details payloads, header authentication contracts, rate limit headers, security headers, and JSON error schema compliance.
 - **Strict Environment Safety:** Release-gate integration tests enforce loopback host targets (`localhost`/`127.0.0.1`), dedicated database names (`disbursement_api_release_gate_test`), and fresh public schema safety validation (`assertFreshReleaseGateDatabase`) to prevent accidental execution against non-test databases.
-- **HTTP Release Contract Suite (`internal/httpapi/release_contract_test.go`):** Enforces standardized JSON error response formatting, `X-Request-ID` propagation, 204 No Content for bodyless responses (`logout`, `delete`), `X-Idempotent-Replayed: true` headers, and `Retry-After` headers for in-progress claims.
+
+### 6. System Resilience & Operational Hardening (`internal/httpapi` & `docs`)
+- **JWT Key Rotation (`kid` Claim):** `KeyProvider` interface supports active signing key (`JWT_KEY_ID`, `JWT_SECRET`) and passive legacy verification keys (`JWT_LEGACY_KEYS`) during zero-downtime key rotation windows.
+- **Operational Health Probes:** Exposes `GET /healthz` (liveness) and `GET /readyz` (readiness probe with database ping check).
+- **Graceful Shutdown & Pool Tuning:** Server handles `SIGINT`/`SIGTERM` with configurable `SHUTDOWN_TIMEOUT` (default `10s`), draining in-flight requests and stopping audit worker loops while in-flight database transactions complete or rollback safely via context cancellation.
+- **Operational Runbook:** Comprehensive maintenance, PITR disaster recovery, secret rotation, and PC-01/PC-02 compliance documentation is available in [`docs/OPERATIONAL_RUNBOOK.md`](docs/OPERATIONAL_RUNBOOK.md).
 
 ---
 
@@ -199,8 +205,10 @@ export HTTP_ADDRESS=":8080"
 |---|---|---|---|
 | `DATABASE_URL` | **Yes** | - | PostgreSQL connection DSN URL |
 | `JWT_SECRET` | **Yes** | - | Secret key for JWT signing and verification |
-| `JWT_ISSUER` | **Yes** | - | Expected JWT `iss` claim value |
-| `JWT_AUDIENCE` | **Yes** | - | Expected JWT `aud` claim value |
+| `JWT_KEY_ID` | No | `v1` | Active key ID embedded in JWT header `kid` claim |
+| `JWT_LEGACY_KEYS` | No | - | Comma-separated legacy key ID:secret pairs (e.g. `v1:secret1,v2:secret2`) |
+| `JWT_ISSUER` | No | `disbursement-api` | Expected JWT `iss` claim value |
+| `JWT_AUDIENCE` | No | `disbursement-api-users` | Expected JWT `aud` claim value |
 | `METRICS_TOKEN` | **Yes** | - | Bearer token for `/metrics` endpoint (`X-Metrics-Token` header) |
 | `HTTP_ADDRESS` | No | `:8080` | Bind address for HTTP server |
 | `HTTP_READ_TIMEOUT` | No | `10s` | HTTP server read timeout |
@@ -208,7 +216,7 @@ export HTTP_ADDRESS=":8080"
 | `HTTP_IDLE_TIMEOUT` | No | `60s` | HTTP server idle connection timeout |
 | `SHUTDOWN_TIMEOUT` | No | `10s` | Maximum grace period for server shutdown |
 | `MAX_REQUEST_BODY_BYTES` | No | `1048576` | Maximum request body limit (default 1 MiB) |
-| `TRUSTED_PROXIES` | No | - | Comma-separated list of trusted reverse proxy CIDRs |
+| `HTTP_TRUSTED_PROXIES` | **Yes (in production)** | - | Comma-separated list of trusted reverse proxy CIDRs/IPs. Mandatory behind load balancers for correct per-instance rate limiting. |
 | `DB_MAX_OPEN_CONNS` | No | `20` | Maximum open database pool connections |
 | `DB_MAX_IDLE_CONNS` | No | `10` | Maximum idle database pool connections |
 | `DB_CONN_MAX_LIFETIME` | No | `30m` | Connection maximum lifetime |
@@ -216,9 +224,9 @@ export HTTP_ADDRESS=":8080"
 | `REFRESH_TOKEN_TTL` | No | `168h` | Refresh Token duration (7 days) |
 | `IDEMPOTENCY_LEASE_TTL` | No | `30s` | Active idempotency claim lease duration |
 | `IDEMPOTENCY_REPLAY_TTL` | No | `24h` | Idempotency response replay retention |
-| `AUDIT_OUTBOX_BATCH_SIZE` | No | `100` | Number of outbox events claimed per relay cycle |
+| `AUDIT_OUTBOX_BATCH_SIZE` | No | `50` | Number of outbox events claimed per relay cycle |
 | `AUDIT_RELAY_INTERVAL` | No | `5s` | Audit relay worker polling interval |
-| `AUDIT_RETENTION_DAYS` | No | `30` | Days before delivered outbox staging records are pruned |
+| `AUDIT_OUTBOX_RETENTION` | No | `720h` | Retention duration for delivered outbox records (30 days) |
 | `POSTGRES_RELEASE_GATE` | No | `0` | Set to `1` to authorize local PostgreSQL release gate integration tests |
 
 ---
@@ -229,11 +237,13 @@ Run all schema migrations and seed local test accounts (`testoperator`, `testadm
 
 ```bash
 # Apply schema migrations and idempotent local seed
-go run ./cmd/migrate -action up -seed
+ALLOW_LOCAL_SEED=1 go run ./cmd/migrate -action up -seed
 
 # Rollback all migrations
 go run ./cmd/migrate -action down
 ```
+
+The seed guard requires both `ALLOW_LOCAL_SEED=1` and a loopback database host, so seeding cannot target a remote or production database.
 
 ---
 

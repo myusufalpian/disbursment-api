@@ -122,7 +122,7 @@ func TestAuditOutboxStore_InsertAndRelayMethods(t *testing.T) {
 			WithArgs(now.Add(-5*time.Minute), now.Add(-15*time.Minute)).
 			WillReturnRows(rows)
 
-		warn, crit, err := store.ReconcilePending(context.Background(), 5*time.Minute)
+		warn, crit, err := store.ReconcilePending(context.Background(), 5*time.Minute, 15*time.Minute)
 		if err != nil {
 			t.Fatalf("ReconcilePending failed: %v", err)
 		}

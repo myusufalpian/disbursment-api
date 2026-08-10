@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"time"
 
 	"disbursment-api/internal/domain"
@@ -22,7 +23,7 @@ type Service struct {
 	sessionStore    repository.RefreshSessionStore
 	transactor      repository.Transactor
 	metrics         *metrics.MetricsCollector
-	jwtSecret       []byte
+	keyProvider     domain.KeyProvider
 	jwtIssuer       string
 	jwtAudience     string
 	accessTokenTTL  time.Duration
@@ -38,7 +39,7 @@ func NewService(
 	accessTokenTTL time.Duration,
 	refreshTokenTTL time.Duration,
 	metricsCollector *metrics.MetricsCollector,
-) *Service {
+) (*Service, error) {
 	return NewServiceWithIssuerAudience(
 		userStore,
 		sessionStore,
@@ -62,7 +63,40 @@ func NewServiceWithIssuerAudience(
 	accessTokenTTL time.Duration,
 	refreshTokenTTL time.Duration,
 	metricsCollector *metrics.MetricsCollector,
-) *Service {
+) (*Service, error) {
+	return NewServiceWithKeyProvider(
+		userStore,
+		sessionStore,
+		transactor,
+		domain.NewStaticKeyProvider("v1", jwtSecret, nil),
+		jwtIssuer,
+		jwtAudience,
+		accessTokenTTL,
+		refreshTokenTTL,
+		metricsCollector,
+	)
+}
+
+func NewServiceWithKeyProvider(
+	userStore repository.UserStore,
+	sessionStore repository.RefreshSessionStore,
+	transactor repository.Transactor,
+	keyProvider domain.KeyProvider,
+	jwtIssuer string,
+	jwtAudience string,
+	accessTokenTTL time.Duration,
+	refreshTokenTTL time.Duration,
+	metricsCollector *metrics.MetricsCollector,
+) (*Service, error) {
+	if userStore == nil || sessionStore == nil || transactor == nil {
+		return nil, fmt.Errorf("userStore, sessionStore, and transactor must not be nil")
+	}
+	if keyProvider == nil {
+		return nil, fmt.Errorf("keyProvider must not be nil")
+	}
+	if _, secret := keyProvider.ActiveKey(); len(secret) == 0 {
+		return nil, fmt.Errorf("keyProvider active secret must not be empty")
+	}
 	if jwtIssuer == "" {
 		jwtIssuer = "disbursement-api"
 	}
@@ -74,20 +108,23 @@ func NewServiceWithIssuerAudience(
 		sessionStore:    sessionStore,
 		transactor:      transactor,
 		metrics:         metricsCollector,
-		jwtSecret:       []byte(jwtSecret),
+		keyProvider:     keyProvider,
 		jwtIssuer:       jwtIssuer,
 		jwtAudience:     jwtAudience,
 		accessTokenTTL:  accessTokenTTL,
 		refreshTokenTTL: refreshTokenTTL,
 		nowFunc:         time.Now,
-	}
+	}, nil
 }
+
+var dummyPasswordHash, _ = bcrypt.GenerateFromPassword([]byte("login-timing-equalizer"), bcrypt.DefaultCost)
 
 func (s *Service) Login(ctx context.Context, req dto.LoginRequest) (*dto.TokenResponse, error) {
 	user, err := s.userStore.FindByUsername(ctx, req.Username)
 	if err != nil {
 		var repoErr *repository.Error
 		if errors.As(err, &repoErr) && repoErr.Category == repository.ErrorNotFound {
+			_ = bcrypt.CompareHashAndPassword(dummyPasswordHash, []byte(req.Password))
 			if s.metrics != nil {
 				s.metrics.RecordAuthFailure("invalid_credentials")
 			}
@@ -221,6 +258,7 @@ func (s *Service) Logout(ctx context.Context, req dto.LogoutRequest) error {
 }
 
 func (s *Service) generateAccessToken(user repository.User, now time.Time) (string, error) {
+	keyID, secret := s.keyProvider.ActiveKey()
 	claims := jwt.MapClaims{
 		"sub":      user.ID.String(),
 		"username": user.Username,
@@ -232,7 +270,10 @@ func (s *Service) generateAccessToken(user repository.User, now time.Time) (stri
 	}
 
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	return token.SignedString(s.jwtSecret)
+	if keyID != "" {
+		token.Header["kid"] = keyID
+	}
+	return token.SignedString(secret)
 }
 
 func hashToken(token string) string {

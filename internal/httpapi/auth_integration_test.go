@@ -20,6 +20,7 @@ import (
 	"disbursment-api/internal/repository"
 	"disbursment-api/internal/service/auth"
 	"disbursment-api/internal/service/disbursement"
+	"disbursment-api/internal/service/idempotency"
 
 	"github.com/google/uuid"
 	"golang.org/x/crypto/bcrypt"
@@ -142,7 +143,10 @@ func newAuthHTTPFixture(t *testing.T) authHTTPFixture {
 	userStore.byID[user.ID] = user
 
 	const secret = "test-secret-key-12345"
-	authService := auth.NewService(userStore, sessionStore, &noopTransactor{}, secret, 15*time.Minute, 7*24*time.Hour, nil)
+	authService, err := auth.NewService(userStore, sessionStore, &noopTransactor{}, secret, 15*time.Minute, 7*24*time.Hour, nil)
+	if err != nil {
+		t.Fatalf("auth service init failed: %v", err)
+	}
 	validatorEngine, err := validation.New()
 	if err != nil {
 		t.Fatalf("validator init failed: %v", err)
@@ -150,7 +154,7 @@ func newAuthHTTPFixture(t *testing.T) authHTTPFixture {
 	authHandler := httpapi.NewAuthHandler(authService, validatorEngine)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	metricsCollector := metrics.NewMetricsCollector()
-	router, err := httpapi.NewRouter(1<<20, logger, secret, "disbursement-api", "disbursement-api-users", authHandler, nil, metricsCollector, "test-metrics-token", nil)
+	router, err := httpapi.NewRouter(1<<20, logger, domain.NewStaticKeyProvider("v1", secret, nil), "disbursement-api", "disbursement-api-users", authHandler, nil, metricsCollector, "test-metrics-token", nil, nil)
 	if err != nil {
 		t.Fatalf("router init failed: %v", err)
 	}
@@ -190,7 +194,13 @@ func newCanonicalDisbursementHTTPFixture(t *testing.T) (http.Handler, uuid.UUID)
 	actorID := uuid.MustParse("990e8400-e29b-41d4-a716-446655440000")
 	store := newMockDisbursementStore()
 	outboxStore := &mockAuditOutboxStore{}
-	disbursementService, err := disbursement.NewService(store, outboxStore, &noopTransactor{}, nil, nil)
+	// Create now always runs through the idempotency coordinator, so the fixture must
+	// provide one: a nil coordinator is rejected by NewService.
+	coordinator, err := idempotency.NewDefaultCoordinator(&mockDisbursementIdempotencyStore{}, 30*time.Second, 24*time.Hour, nil)
+	if err != nil {
+		t.Fatalf("failed to create idempotency coordinator: %v", err)
+	}
+	disbursementService, err := disbursement.NewService(store, outboxStore, &noopTransactor{}, coordinator, nil)
 	if err != nil {
 		t.Fatalf("failed to create disbursement service: %v", err)
 	}
@@ -200,7 +210,7 @@ func newCanonicalDisbursementHTTPFixture(t *testing.T) (http.Handler, uuid.UUID)
 	}
 	disbursementHandler := httpapi.NewDisbursementHandler(disbursementService, validatorEngine)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	router, err := httpapi.NewRouter(1<<20, logger, secret, "disbursement-api", "disbursement-api-users", nil, disbursementHandler, nil, "test-metrics-token", nil)
+	router, err := httpapi.NewRouter(1<<20, logger, domain.NewStaticKeyProvider("v1", secret, nil), "disbursement-api", "disbursement-api-users", nil, disbursementHandler, nil, "test-metrics-token", nil, nil)
 	if err != nil {
 		t.Fatalf("router init failed: %v", err)
 	}
@@ -328,6 +338,7 @@ func TestAuthHTTPIntegration(t *testing.T) {
 			Note:          "Canonical contract",
 		})
 		request.Header.Set("Authorization", "Bearer "+generateTestToken("test-secret-key-12345", actorID, domain.RoleOperator))
+		request.Header.Set("Idempotency-Key", "00000000-0000-4000-8000-000000000000")
 		response := httptest.NewRecorder()
 		router.ServeHTTP(response, request)
 

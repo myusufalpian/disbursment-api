@@ -9,6 +9,8 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+const unmatchedRouteLabel = "unmatched"
+
 func AccessLog(logger *slog.Logger, collector *metrics.MetricsCollector) gin.HandlerFunc {
 	return func(context *gin.Context) {
 		startedAt := time.Now()
@@ -21,7 +23,8 @@ func AccessLog(logger *slog.Logger, collector *metrics.MetricsCollector) gin.Han
 		requestID := RequestIDFromContext(context.Request.Context())
 		clientIP := context.ClientIP()
 
-		if logger != nil {
+		isProbe := path == "/healthz" || path == "/readyz"
+		if logger != nil && !isProbe {
 			attrs := []slog.Attr{
 				slog.String("request_id", requestID),
 				slog.String("method", method),
@@ -39,8 +42,12 @@ func AccessLog(logger *slog.Logger, collector *metrics.MetricsCollector) gin.Han
 			logger.LogAttrs(context.Request.Context(), slog.LevelInfo, "request completed", attrs...)
 		}
 
-		if collector != nil {
-			collector.RecordHTTPRequest(method, path, status, latencyMs)
+		if collector != nil && !isProbe {
+			metricPath := context.FullPath()
+			if metricPath == "" {
+				metricPath = unmatchedRouteLabel
+			}
+			collector.RecordHTTPRequest(method, metricPath, status, latencyMs)
 		}
 	}
 }

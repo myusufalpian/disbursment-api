@@ -25,6 +25,13 @@ type ReconciliationReport struct {
 	CriticalCount int
 }
 
+type RelayConfig struct {
+	WarningAge             time.Duration
+	ReconciliationInterval time.Duration
+	OutboxRetention        time.Duration
+	CriticalAge            time.Duration
+}
+
 type RelayService struct {
 	outboxStore     repository.AuditOutboxStore
 	projectionStore repository.AuditProjectionStore
@@ -34,6 +41,10 @@ type RelayService struct {
 	running         bool
 	stopChan        chan struct{}
 	workerDone      chan struct{}
+	warningAge      time.Duration
+	reconInterval   time.Duration
+	outboxRetention time.Duration
+	criticalAge     time.Duration
 }
 
 func NewRelayService(
@@ -41,6 +52,7 @@ func NewRelayService(
 	projectionStore repository.AuditProjectionStore,
 	metrics MetricsReporter,
 	logger *slog.Logger,
+	cfg RelayConfig,
 ) (*RelayService, error) {
 	if outboxStore == nil {
 		return nil, fmt.Errorf("audit outbox store required")
@@ -56,6 +68,10 @@ func NewRelayService(
 		projectionStore: projectionStore,
 		metrics:         metrics,
 		logger:          logger,
+		warningAge:      cfg.WarningAge,
+		reconInterval:   cfg.ReconciliationInterval,
+		outboxRetention: cfg.OutboxRetention,
+		criticalAge:     cfg.CriticalAge,
 	}, nil
 }
 
@@ -123,7 +139,7 @@ func (s *RelayService) ProcessBatch(ctx context.Context, batchSize int) (int, er
 }
 
 func (s *RelayService) Reconcile(ctx context.Context) (ReconciliationReport, error) {
-	warningCount, criticalCount, err := s.outboxStore.ReconcilePending(ctx, 5*time.Minute)
+	warningCount, criticalCount, err := s.outboxStore.ReconcilePending(ctx, s.warningAge, s.criticalAge)
 	if err != nil {
 		s.logger.Error("failed to run outbox reconciliation", slog.String("error", err.Error()))
 		return ReconciliationReport{}, fmt.Errorf("outbox reconciliation failed: %w", err)
@@ -146,12 +162,8 @@ func (s *RelayService) Reconcile(ctx context.Context) (ReconciliationReport, err
 	}, nil
 }
 
-func (s *RelayService) Cleanup(ctx context.Context, retentionDays int) (int64, error) {
-	if retentionDays <= 0 {
-		retentionDays = 30
-	}
-	duration := time.Duration(retentionDays) * 24 * time.Hour
-	cleaned, err := s.outboxStore.CleanupDelivered(ctx, duration)
+func (s *RelayService) Cleanup(ctx context.Context) (int64, error) {
+	cleaned, err := s.outboxStore.CleanupDelivered(ctx, s.outboxRetention)
 	if err != nil {
 		s.logger.Error("failed to cleanup delivered outbox events", slog.String("error", err.Error()))
 		return 0, fmt.Errorf("outbox cleanup failed: %w", err)
@@ -183,7 +195,10 @@ func (s *RelayService) StartWorker(ctx context.Context, interval time.Duration, 
 		processTicker := time.NewTicker(interval)
 		defer processTicker.Stop()
 
-		reconcileInterval := 15 * time.Minute
+		reconcileInterval := s.reconInterval
+		if reconcileInterval <= 0 {
+			reconcileInterval = 15 * time.Minute
+		}
 		if interval < 1*time.Second {
 			reconcileInterval = 50 * time.Millisecond
 		}
@@ -200,7 +215,7 @@ func (s *RelayService) StartWorker(ctx context.Context, interval time.Duration, 
 		// Run immediate initial execution
 		_, _ = s.ProcessBatch(ctx, batchSize)
 		_, _ = s.Reconcile(ctx)
-		_, _ = s.Cleanup(ctx, 30)
+		_, _ = s.Cleanup(ctx)
 
 		for {
 			select {
@@ -214,7 +229,7 @@ func (s *RelayService) StartWorker(ctx context.Context, interval time.Duration, 
 			case <-reconcileTicker.C:
 				_, _ = s.Reconcile(ctx)
 			case <-cleanupTicker.C:
-				_, _ = s.Cleanup(ctx, 30)
+				_, _ = s.Cleanup(ctx)
 			}
 		}
 	}()

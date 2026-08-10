@@ -83,6 +83,7 @@ func TestMetricsCollector_FullCoverage(t *testing.T) {
 	t.Run("RecordAuthFailure, Delivery, Backlog, Reconciliation, DBStats", func(t *testing.T) {
 		collector := NewMetricsCollector()
 		collector.RecordAuthFailure("invalid_credentials")
+		collector.RecordRateLimiterEviction()
 		collector.RecordDeliverySuccess()
 		collector.RecordDeliveryFailure()
 		collector.SetBacklogDepth(15)
@@ -92,6 +93,9 @@ func TestMetricsCollector_FullCoverage(t *testing.T) {
 		snapshot := collector.Snapshot()
 		if snapshot.AuthFailuresTotal["invalid_credentials"] != 1 {
 			t.Fatalf("expected 1 auth failure")
+		}
+		if snapshot.RateLimiterEvictionsTotal != 1 {
+			t.Fatalf("expected 1 rate-limiter capacity eviction")
 		}
 		if snapshot.OutboxDeliveriesTotal != 1 || snapshot.OutboxDeliveryFailures != 1 {
 			t.Fatalf("expected 1 delivery success & failure")
@@ -219,6 +223,7 @@ func TestMetricsCollectorHTTPHandlerContract(t *testing.T) {
 			"idempotency_claims_total",
 			"finalizations_total",
 			"auth_failures_total",
+			"rate_limiter_capacity_evictions_total",
 			"outbox_backlog_depth",
 			"outbox_deliveries_total",
 			"outbox_delivery_failures_total",

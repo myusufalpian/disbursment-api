@@ -75,7 +75,7 @@ type AuditOutboxStore interface {
 	FetchPending(context.Context, int) ([]domain.AuditEvent, error)
 	MarkDelivered(context.Context, uuid.UUID, time.Time) error
 	RecordFailure(context.Context, uuid.UUID, string, time.Time) error
-	ReconcilePending(context.Context, time.Duration) (int, int, error)
+	ReconcilePending(context.Context, time.Duration, time.Duration) (int, int, error)
 	CleanupDelivered(context.Context, time.Duration) (int64, error)
 }
 

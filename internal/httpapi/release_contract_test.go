@@ -160,7 +160,11 @@ func TestDisbursementRepeatDeleteContractPreservesDeletionAndSingleAuditEvent(t 
 		UpdatedAt:     createdAt,
 	}
 	outboxStore := &mockAuditOutboxStore{}
-	service, err := disbursement.NewService(store, outboxStore, mockTransactor{}, nil, nil)
+	coordinator, err := idempotency.NewDefaultCoordinator(&mockDisbursementIdempotencyStore{}, 30*time.Second, 24*time.Hour, nil)
+	if err != nil {
+		t.Fatalf("create idempotency coordinator: %v", err)
+	}
+	service, err := disbursement.NewService(store, outboxStore, mockTransactor{}, coordinator, nil)
 	if err != nil {
 		t.Fatalf("create disbursement service: %v", err)
 	}
@@ -172,13 +176,14 @@ func TestDisbursementRepeatDeleteContractPreservesDeletionAndSingleAuditEvent(t 
 	router, err := httpapi.NewRouter(
 		1<<20,
 		slog.New(slog.NewTextHandler(io.Discard, nil)),
-		contractJWTSecret,
+		domain.NewStaticKeyProvider("v1", contractJWTSecret, nil),
 		"disbursement-api",
 		"disbursement-api-users",
 		nil,
 		handler,
 		nil,
 		"test-metrics-token",
+		nil,
 		nil,
 	)
 	if err != nil {
@@ -248,7 +253,7 @@ func newAuthContractRouter(t *testing.T) (http.Handler, string) {
 	userStore.users[user.Username] = user
 	userStore.byID[user.ID] = user
 
-	authService := auth.NewService(
+	authService, err := auth.NewService(
 		userStore,
 		newInMemorySessionStore(),
 		&noopTransactor{},
@@ -257,6 +262,9 @@ func newAuthContractRouter(t *testing.T) (http.Handler, string) {
 		7*24*time.Hour,
 		nil,
 	)
+	if err != nil {
+		t.Fatalf("create auth service: %v", err)
+	}
 	validator, err := validation.New()
 	if err != nil {
 		t.Fatalf("create validator: %v", err)
@@ -264,13 +272,14 @@ func newAuthContractRouter(t *testing.T) (http.Handler, string) {
 	router, err := httpapi.NewRouter(
 		1<<20,
 		slog.New(slog.NewTextHandler(io.Discard, nil)),
-		contractJWTSecret,
+		domain.NewStaticKeyProvider("v1", contractJWTSecret, nil),
 		"disbursement-api",
 		"disbursement-api-users",
 		httpapi.NewAuthHandler(authService, validator),
 		nil,
 		metrics.NewMetricsCollector(),
 		"test-metrics-token",
+		nil,
 		nil,
 	)
 	if err != nil {
@@ -383,13 +392,14 @@ func newReplayContractRouterWithStore(t *testing.T, replayStore *httpReplayStore
 	router, err := httpapi.NewRouter(
 		1<<20,
 		slog.New(slog.NewTextHandler(io.Discard, nil)),
-		contractJWTSecret,
+		domain.NewStaticKeyProvider("v1", contractJWTSecret, nil),
 		"disbursement-api",
 		"disbursement-api-users",
 		nil,
 		handler,
 		nil,
 		"test-metrics-token",
+		nil,
 		nil,
 	)
 	if err != nil {

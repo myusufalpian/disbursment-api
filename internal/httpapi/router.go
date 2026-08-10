@@ -17,7 +17,7 @@ import (
 func NewRouter(
 	maxRequestBodyBytes int64,
 	logger *slog.Logger,
-	jwtSecret string,
+	keyProvider domain.KeyProvider,
 	jwtIssuer string,
 	jwtAudience string,
 	authHandler *AuthHandler,
@@ -25,6 +25,7 @@ func NewRouter(
 	metricsCollector *metrics.MetricsCollector,
 	metricsToken string,
 	trustedProxies []string,
+	healthChecker HealthChecker,
 ) (*gin.Engine, error) {
 	router := gin.New()
 	if len(trustedProxies) > 0 {
@@ -36,12 +37,17 @@ func NewRouter(
 			return nil, fmt.Errorf("disable trusted proxies: %w", err)
 		}
 	}
+
 	router.Use(
 		middleware.RequestID(),
 		middleware.AccessLog(logger, metricsCollector),
 		middleware.Recovery(logger),
 		middleware.BodyLimit(maxRequestBodyBytes),
 	)
+
+	healthHandler := NewHealthHandler(healthChecker, logger)
+	router.GET("/healthz", healthHandler.Healthz)
+	router.GET("/readyz", healthHandler.Readyz)
 
 	if metricsCollector != nil {
 		router.GET("/metrics", metricsCollector.HTTPHandler(metricsToken))
@@ -51,8 +57,8 @@ func NewRouter(
 		registerAuthRoutes(router, authHandler, metricsCollector)
 	}
 
-	if disbursementHandler != nil && jwtSecret != "" {
-		registerDisbursementRoutes(router, jwtSecret, jwtIssuer, jwtAudience, disbursementHandler, metricsCollector)
+	if disbursementHandler != nil && keyProvider != nil {
+		registerDisbursementRoutes(router, keyProvider, jwtIssuer, jwtAudience, disbursementHandler, metricsCollector)
 	}
 
 	router.NoRoute(func(context *gin.Context) {
@@ -80,8 +86,8 @@ func registerAuthRoutes(router *gin.Engine, authHandler *AuthHandler, collector 
 	}
 }
 
-func registerDisbursementRoutes(router *gin.Engine, jwtSecret string, jwtIssuer string, jwtAudience string, handler *DisbursementHandler, metricsCollector *metrics.MetricsCollector) {
-	authMiddleware := middleware.Authenticate(jwtSecret, jwtIssuer, jwtAudience, metricsCollector)
+func registerDisbursementRoutes(router *gin.Engine, keyProvider domain.KeyProvider, jwtIssuer string, jwtAudience string, handler *DisbursementHandler, metricsCollector *metrics.MetricsCollector) {
+	authMiddleware := middleware.AuthenticateWithKeyProvider(keyProvider, jwtIssuer, jwtAudience, metricsCollector)
 
 	registerGroup := func(group *gin.RouterGroup) {
 		group.Use(authMiddleware)

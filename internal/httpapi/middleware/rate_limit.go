@@ -85,23 +85,40 @@ func rateLimitHandler(limiter *ipRateLimiter, collector *metrics.MetricsCollecto
 			return
 		}
 
+		evicted := false
 		if len(times) == 0 && len(limiter.requests) >= maxTrackedClients {
-			limiter.mu.Unlock()
-			c.Header("Retry-After", "60")
-			response.WriteError(c.Writer, RequestIDFromContext(c.Request.Context()), &domain.Error{
-				Code:    "TOO_MANY_REQUESTS",
-				Message: "Terlalu banyak percobaan, silakan coba beberapa saat lagi",
-				Status:  http.StatusTooManyRequests,
-			})
-			c.Abort()
-			return
+			limiter.cleanupExpired(now)
+			if len(limiter.requests) >= maxTrackedClients {
+				limiter.evictLeastRecent()
+				evicted = true
+			}
 		}
 
 		valid = append(valid, now)
 		limiter.requests[clientIP] = valid
 		limiter.mu.Unlock()
 
+		if evicted && collector != nil {
+			collector.RecordRateLimiterEviction()
+		}
 		c.Next()
+	}
+}
+
+func (l *ipRateLimiter) evictLeastRecent() {
+	var oldestIP string
+	var oldest time.Time
+	found := false
+	for ip, times := range l.requests {
+		mostRecent := times[len(times)-1]
+		if !found || mostRecent.Before(oldest) {
+			oldestIP = ip
+			oldest = mostRecent
+			found = true
+		}
+	}
+	if found {
+		delete(l.requests, oldestIP)
 	}
 }
 
