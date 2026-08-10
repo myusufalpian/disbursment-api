@@ -19,6 +19,7 @@ import (
 	"disbursment-api/internal/httpapi/validation"
 	"disbursment-api/internal/repository"
 	"disbursment-api/internal/service/disbursement"
+	"disbursment-api/internal/service/idempotency"
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
@@ -168,7 +169,7 @@ func (m *mockAuditOutboxStore) MarkDelivered(ctx context.Context, eventID uuid.U
 func (m *mockAuditOutboxStore) RecordFailure(ctx context.Context, eventID uuid.UUID, errMessage string, nextAvailableAt time.Time) error {
 	return nil
 }
-func (m *mockAuditOutboxStore) ReconcilePending(ctx context.Context, minAge time.Duration) (int, int, error) {
+func (m *mockAuditOutboxStore) ReconcilePending(ctx context.Context, minAge time.Duration, criticalAge time.Duration) (int, int, error) {
 	return 0, 0, nil
 }
 func (m *mockAuditOutboxStore) CleanupDelivered(ctx context.Context, olderThan time.Duration) (int64, error) {
@@ -181,6 +182,24 @@ type mockTransaction struct{}
 func (m mockTransaction) Context() context.Context { return context.Background() }
 func (m mockTransactor) WithinTransaction(ctx context.Context, fn func(context.Context, repository.Transaction) error) error {
 	return fn(ctx, mockTransaction{})
+}
+
+type mockDisbursementIdempotencyStore struct{}
+
+func (m *mockDisbursementIdempotencyStore) Acquire(ctx context.Context, req domain.IdempotencyClaimRequest) (domain.IdempotencyClaimResult, error) {
+	return domain.IdempotencyClaimResult{Outcome: domain.ClaimAcquired, ClaimID: req.ClaimID}, nil
+}
+
+func (m *mockDisbursementIdempotencyStore) VerifyOwnership(ctx context.Context, tx repository.Transaction, scope domain.IdempotencyScope, claimID uuid.UUID) error {
+	return nil
+}
+
+func (m *mockDisbursementIdempotencyStore) Complete(ctx context.Context, tx repository.Transaction, completion domain.IdempotencyCompletion) error {
+	return nil
+}
+
+func (m *mockDisbursementIdempotencyStore) Release(ctx context.Context, scope domain.IdempotencyScope, claimID uuid.UUID) error {
+	return nil
 }
 
 func generateTestToken(secret string, userID uuid.UUID, role domain.UserRole) string {
@@ -210,7 +229,11 @@ func TestDisbursementEndpointsIntegration(t *testing.T) {
 	outboxStore := &mockAuditOutboxStore{}
 	transactor := mockTransactor{}
 
-	disbursementService, err := disbursement.NewService(store, outboxStore, transactor, nil, nil)
+	coordinator, err := idempotency.NewDefaultCoordinator(&mockDisbursementIdempotencyStore{}, 30*time.Second, 24*time.Hour, nil)
+	if err != nil {
+		t.Fatalf("failed to create idempotency coordinator: %v", err)
+	}
+	disbursementService, err := disbursement.NewService(store, outboxStore, transactor, coordinator, nil)
 	if err != nil {
 		t.Fatalf("failed to create disbursement service: %v", err)
 	}
@@ -222,7 +245,7 @@ func TestDisbursementEndpointsIntegration(t *testing.T) {
 
 	handler := httpapi.NewDisbursementHandler(disbursementService, validatorEngine)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	router, err := httpapi.NewRouter(1<<20, logger, jwtSecret, "disbursement-api", "disbursement-api-users", nil, handler, nil, "test-metrics-token", nil)
+	router, err := httpapi.NewRouter(1<<20, logger, domain.NewStaticKeyProvider("v1", jwtSecret, nil), "disbursement-api", "disbursement-api-users", nil, handler, nil, "test-metrics-token", nil, nil)
 	if err != nil {
 		t.Fatalf("router init failed: %v", err)
 	}
@@ -241,6 +264,7 @@ func TestDisbursementEndpointsIntegration(t *testing.T) {
 		req, _ := http.NewRequest(http.MethodPost, "/disbursements", bytes.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Authorization", "Bearer "+operatorToken)
+		req.Header.Set("Idempotency-Key", "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d")
 		w := httptest.NewRecorder()
 
 		router.ServeHTTP(w, req)
@@ -266,10 +290,72 @@ func TestDisbursementEndpointsIntegration(t *testing.T) {
 		}
 	})
 
+	t.Run("POST /disbursements - Missing Idempotency-Key", func(t *testing.T) {
+		before := len(store.items)
+		body, _ := json.Marshal(dto.CreateDisbursementRequest{
+			RecipientName: "Missing Key Recipient",
+			AccountNumber: "1234567890",
+			BankCode:      "BCA",
+			Amount:        500000,
+		})
+		req, _ := http.NewRequest(http.MethodPost, "/disbursements", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+operatorToken)
+		w := httptest.NewRecorder()
+
+		router.ServeHTTP(w, req)
+
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("expected status 400, got %d: %s", w.Code, w.Body.String())
+		}
+		var envelope errorResponseEnvelope
+		if err := json.Unmarshal(w.Body.Bytes(), &envelope); err != nil {
+			t.Fatalf("decode error envelope: %v", err)
+		}
+		if string(envelope.Error.Code) != "INVALID_IDEMPOTENCY_KEY" {
+			t.Fatalf("expected error code INVALID_IDEMPOTENCY_KEY, got %q", envelope.Error.Code)
+		}
+		if len(store.items) != before {
+			t.Fatalf("expected no disbursement creation, item count changed from %d to %d", before, len(store.items))
+		}
+	})
+
+	t.Run("POST /disbursements - Invalid Idempotency-Key", func(t *testing.T) {
+		before := len(store.items)
+		body, _ := json.Marshal(dto.CreateDisbursementRequest{
+			RecipientName: "Invalid Key Recipient",
+			AccountNumber: "1234567890",
+			BankCode:      "BCA",
+			Amount:        500000,
+		})
+		req, _ := http.NewRequest(http.MethodPost, "/disbursements", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+operatorToken)
+		req.Header.Set("Idempotency-Key", "not-a-uuid")
+		w := httptest.NewRecorder()
+
+		router.ServeHTTP(w, req)
+
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("expected status 400, got %d: %s", w.Code, w.Body.String())
+		}
+		var envelope errorResponseEnvelope
+		if err := json.Unmarshal(w.Body.Bytes(), &envelope); err != nil {
+			t.Fatalf("decode error envelope: %v", err)
+		}
+		if string(envelope.Error.Code) != "INVALID_IDEMPOTENCY_KEY" {
+			t.Fatalf("expected error code INVALID_IDEMPOTENCY_KEY, got %q", envelope.Error.Code)
+		}
+		if len(store.items) != before {
+			t.Fatalf("expected no disbursement creation, item count changed from %d to %d", before, len(store.items))
+		}
+	})
+
 	t.Run("POST /disbursements - Invalid JSON body", func(t *testing.T) {
 		req, _ := http.NewRequest(http.MethodPost, "/disbursements", bytes.NewReader([]byte("{invalid-json")))
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Authorization", "Bearer "+operatorToken)
+		req.Header.Set("Idempotency-Key", "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d")
 		w := httptest.NewRecorder()
 
 		router.ServeHTTP(w, req)
@@ -289,6 +375,7 @@ func TestDisbursementEndpointsIntegration(t *testing.T) {
 		req, _ := http.NewRequest(http.MethodPost, "/disbursements", bytes.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Authorization", "Bearer "+operatorToken)
+		req.Header.Set("Idempotency-Key", "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d")
 		w := httptest.NewRecorder()
 
 		router.ServeHTTP(w, req)
@@ -503,6 +590,7 @@ func TestDisbursementEndpointsIntegration(t *testing.T) {
 		req1, _ := http.NewRequest(http.MethodPost, "/disbursements", bytes.NewReader([]byte(`{invalid`)))
 		req1.Header.Set("Content-Type", "application/json")
 		req1.Header.Set("Authorization", "Bearer "+operatorToken)
+		req1.Header.Set("Idempotency-Key", "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d")
 		w1 := httptest.NewRecorder()
 		router.ServeHTTP(w1, req1)
 		if w1.Code != http.StatusBadRequest {
@@ -519,6 +607,7 @@ func TestDisbursementEndpointsIntegration(t *testing.T) {
 		req2, _ := http.NewRequest(http.MethodPost, "/disbursements", bytes.NewReader(body))
 		req2.Header.Set("Content-Type", "application/json")
 		req2.Header.Set("Authorization", "Bearer "+operatorToken)
+		req2.Header.Set("Idempotency-Key", "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d")
 		w2 := httptest.NewRecorder()
 		router.ServeHTTP(w2, req2)
 		if w2.Code != http.StatusBadRequest {

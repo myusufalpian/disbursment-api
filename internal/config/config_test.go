@@ -66,6 +66,8 @@ func TestLoadRejectsInvalidOptionalValues(t *testing.T) {
 		want    string
 	}{
 		{name: "malformed duration", envName: "HTTP_READ_TIMEOUT", value: "tomorrow", want: "HTTP_READ_TIMEOUT must be a positive duration"},
+		{name: "legacy keys malformed pair", envName: "JWT_LEGACY_KEYS", value: "v1-oldsecret", want: "JWT_LEGACY_KEYS contains malformed pair"},
+		{name: "legacy keys contains active key ID", envName: "JWT_LEGACY_KEYS", value: "v1:old", want: "contains active key ID"},
 		{name: "negative open connections", envName: "DB_MAX_OPEN_CONNS", value: "-1", want: "DB_MAX_OPEN_CONNS must be an integer greater than or equal to 1"},
 		{name: "idle connections exceed open connections", envName: "DB_MAX_IDLE_CONNS", value: "21", want: "database pool limits are invalid"},
 	}
@@ -201,4 +203,21 @@ func TestLoadRejectsInvalidValidationBranches(t *testing.T) {
 			t.Fatalf("expected database URL scheme error, got %v", err)
 		}
 	})
+}
+
+func TestLoadParsesValidLegacyKeys(t *testing.T) {
+	setValidEnvironment(t)
+	t.Setenv("JWT_KEY_ID", "v2")
+	t.Setenv("JWT_LEGACY_KEYS", "v1:old,v0:older")
+
+	configuration, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if len(configuration.Security.JWTLegacyKeys) != 2 {
+		t.Errorf("expected 2 legacy keys, got %d", len(configuration.Security.JWTLegacyKeys))
+	}
+	if configuration.Security.JWTLegacyKeys["v1"] != "old" || configuration.Security.JWTLegacyKeys["v0"] != "older" {
+		t.Errorf("legacy keys mismatch: %v", configuration.Security.JWTLegacyKeys)
+	}
 }

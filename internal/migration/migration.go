@@ -4,8 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/golang-migrate/migrate/v4"
 	_ "github.com/golang-migrate/migrate/v4/database/postgres"
@@ -40,6 +43,7 @@ func Run(databaseURL, directory, action string, steps int) error {
 	default:
 		return fmt.Errorf("unsupported migration action %q", action)
 	}
+	// A repeatable migration command should treat an already-current schema as success.
 	if errors.Is(err, migrate.ErrNoChange) {
 		return nil
 	}
@@ -47,6 +51,31 @@ func Run(databaseURL, directory, action string, steps int) error {
 		return fmt.Errorf("run migrations: %w", err)
 	}
 	return nil
+}
+
+const AllowLocalSeedEnv = "ALLOW_LOCAL_SEED"
+
+func AssertLocalSeedTarget(databaseURL string, authorized bool) error {
+	if !authorized {
+		return fmt.Errorf("seeding fixed-credential accounts requires %s=1", AllowLocalSeedEnv)
+	}
+	parsed, err := url.Parse(databaseURL)
+	if err != nil {
+		return fmt.Errorf("parse database URL: %w", err)
+	}
+	if !isLoopbackSeedHost(parsed.Hostname()) {
+		return fmt.Errorf("seed target must be a loopback database host, got %q", parsed.Hostname())
+	}
+	return nil
+}
+
+func isLoopbackSeedHost(host string) bool {
+	host = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func ApplySeed(ctx context.Context, database *sqlx.DB, path string) error {

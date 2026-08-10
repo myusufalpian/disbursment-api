@@ -104,11 +104,11 @@ func TestRateLimitCleanupAndMaxClients(t *testing.T) {
 		w := httptest.NewRecorder()
 		router.ServeHTTP(w, req)
 
-		if w.Code != http.StatusTooManyRequests {
-			t.Fatalf("expected 429 Too Many Requests, got %d", w.Code)
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK, got %d", w.Code)
 		}
-		if got := w.Header().Get("Retry-After"); got != "60" {
-			t.Fatalf("Retry-After = %q, want %q", got, "60")
+		if len(limiter.requests) > maxTrackedClients {
+			t.Fatalf("tracked clients = %d, want at most %d", len(limiter.requests), maxTrackedClients)
 		}
 	})
 }

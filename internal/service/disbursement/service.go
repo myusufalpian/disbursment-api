@@ -36,7 +36,7 @@ func NewService(
 	coordinator *idempotency.Coordinator,
 	metricsCollector *metrics.MetricsCollector,
 ) (*Service, error) {
-	if disbursementStore == nil || auditOutboxStore == nil || transactor == nil {
+	if disbursementStore == nil || auditOutboxStore == nil || transactor == nil || coordinator == nil {
 		return nil, fmt.Errorf("invalid disbursement service dependencies")
 	}
 	return &Service{
@@ -86,35 +86,6 @@ func (s *Service) Create(
 		UpdatedAt:     now,
 	}
 
-	// Case 1: No idempotency key provided
-	if idempotencyKey == "" || s.coordinator == nil {
-		err := s.transactor.WithinTransaction(ctx, func(ctx context.Context, tx repository.Transaction) error {
-			if err := s.disbursementStore.Insert(ctx, tx, disbursement); err != nil {
-				return err
-			}
-			event, err := domain.NewAuditEvent(
-				uuid.New(),
-				"disbursement",
-				disbursement.ID,
-				"disbursement.created",
-				actorID,
-				requestID,
-				nil,
-				disbursement,
-				now,
-			)
-			if err != nil {
-				return err
-			}
-			return s.auditOutboxStore.Insert(ctx, tx, event)
-		})
-		if err != nil {
-			return CreateResult{}, s.mapRepositoryError(err)
-		}
-		return CreateResult{Disbursement: disbursement, IsReplay: false}, nil
-	}
-
-	// Case 2: Idempotency key provided
 	parsedKey, err := domain.ParseIdempotencyKey(idempotencyKey)
 	if err != nil {
 		return CreateResult{}, err
@@ -380,9 +351,6 @@ func (s *Service) mapIdempotencyError(err error) error {
 	}
 	if domainErr, ok := err.(*domain.Error); ok {
 		return domainErr
-	}
-	if err.Error() == "idempotency key reused with different payload" {
-		return domain.IdempotencyKeyReused()
 	}
 	return domain.Internal()
 }

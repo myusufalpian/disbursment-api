@@ -10,6 +10,7 @@ import (
 
 	"disbursment-api/internal/config"
 	"disbursment-api/internal/database"
+	"disbursment-api/internal/domain"
 	"disbursment-api/internal/httpapi"
 	"disbursment-api/internal/httpapi/validation"
 	"disbursment-api/internal/observability/metrics"
@@ -28,9 +29,26 @@ type Application struct {
 	relayService    *audit.RelayService
 	metrics         *metrics.MetricsCollector
 	shutdownTimeout time.Duration
+	relayInterval   time.Duration
+	outboxBatchSize int
+}
+
+func warnOnUntrustedProxyConfiguration(configuration config.Config, logger *slog.Logger) {
+	if logger == nil || len(configuration.HTTP.TrustedProxies) > 0 {
+		return
+	}
+	logger.Warn(
+		"HTTP_TRUSTED_PROXIES is empty: per-IP rate limiting and client IP attribution are unreliable behind a proxy",
+		slog.String("remediation", "set HTTP_TRUSTED_PROXIES to the reverse proxy CIDRs when deploying behind a load balancer"),
+	)
 }
 
 func New(ctx context.Context, config config.Config, logger *slog.Logger) (*Application, error) {
+	if err := config.ValidateSecretStrength(); err != nil {
+		return nil, err
+	}
+	warnOnUntrustedProxyConfiguration(config, logger)
+
 	db, err := database.Open(ctx, config.Database)
 	if err != nil {
 		return nil, err
@@ -46,7 +64,12 @@ func New(ctx context.Context, config config.Config, logger *slog.Logger) (*Appli
 	auditProjectionStore := postgres.NewAuditProjectionStore(db)
 	idempotencyStore := postgres.NewIdempotencyStore(db)
 
-	relayService, err := audit.NewRelayService(auditOutboxStore, auditProjectionStore, metricsCollector, logger)
+	relayService, err := audit.NewRelayService(auditOutboxStore, auditProjectionStore, metricsCollector, logger, audit.RelayConfig{
+		WarningAge:             config.Audit.WarningAge,
+		ReconciliationInterval: config.Audit.ReconciliationInterval,
+		OutboxRetention:        config.Audit.OutboxRetention,
+		CriticalAge:            config.Audit.CriticalAge,
+	})
 	if err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("audit relay service init failed: %w", err)
@@ -63,17 +86,27 @@ func New(ctx context.Context, config config.Config, logger *slog.Logger) (*Appli
 		return nil, fmt.Errorf("idempotency coordinator init failed: %w", err)
 	}
 
-	authService := auth.NewServiceWithIssuerAudience(
+	keyProvider := domain.NewStaticKeyProvider(
+		config.Security.JWTKeyID,
+		config.Security.JWTSecret,
+		config.Security.JWTLegacyKeys,
+	)
+
+	authService, err := auth.NewServiceWithKeyProvider(
 		userStore,
 		sessionStore,
 		transactor,
-		config.Security.JWTSecret,
+		keyProvider,
 		config.Security.JWTIssuer,
 		config.Security.JWTAudience,
 		config.Security.AccessTokenTTL,
 		config.Security.RefreshTokenTTL,
 		metricsCollector,
 	)
+	if err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("auth service init failed: %w", err)
+	}
 
 	disbursementService, err := disbursement.NewService(
 		disbursementStore,
@@ -99,7 +132,7 @@ func New(ctx context.Context, config config.Config, logger *slog.Logger) (*Appli
 	router, err := httpapi.NewRouter(
 		config.HTTP.MaxRequestBodyBytes,
 		logger,
-		config.Security.JWTSecret,
+		keyProvider,
 		config.Security.JWTIssuer,
 		config.Security.JWTAudience,
 		authHandler,
@@ -107,6 +140,7 @@ func New(ctx context.Context, config config.Config, logger *slog.Logger) (*Appli
 		metricsCollector,
 		config.HTTP.MetricsToken,
 		config.HTTP.TrustedProxies,
+		db,
 	)
 	if err != nil {
 		_ = db.Close()
@@ -125,6 +159,8 @@ func New(ctx context.Context, config config.Config, logger *slog.Logger) (*Appli
 			IdleTimeout:  config.HTTP.IdleTimeout,
 		},
 		shutdownTimeout: config.HTTP.ShutdownTimeout,
+		relayInterval:   config.Audit.RelayInterval,
+		outboxBatchSize: config.Audit.OutboxBatchSize,
 	}, nil
 }
 
@@ -132,7 +168,7 @@ func (application *Application) Run(ctx context.Context) error {
 	defer application.database.Close()
 
 	if application.relayService != nil {
-		if err := application.relayService.StartWorker(ctx, 5*time.Second, 50); err != nil {
+		if err := application.relayService.StartWorker(ctx, application.relayInterval, application.outboxBatchSize); err != nil {
 			return fmt.Errorf("start audit relay worker: %w", err)
 		}
 		defer application.relayService.StopWorker()

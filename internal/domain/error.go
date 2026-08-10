@@ -57,6 +57,14 @@ func InvalidCredentials() *Error {
 	}
 }
 
+func InvalidIdempotencyKey() *Error {
+	return &Error{
+		Code:    CodeInvalidIdempotencyKey,
+		Message: "Header Idempotency-Key tidak valid atau tidak ada",
+		Status:  400,
+	}
+}
+
 func Unauthorized() *Error {
 	return &Error{
 		Code:    CodeUnauthorized,

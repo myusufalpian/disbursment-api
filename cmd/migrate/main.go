@@ -24,16 +24,22 @@ func main() {
 		slog.Error("configuration error", slog.String("error", err.Error()))
 		os.Exit(1)
 	}
+	if *seed {
+		if *action != "up" {
+			slog.Error("seed requires up migration action")
+			os.Exit(1)
+		}
+		if err := migration.AssertLocalSeedTarget(databaseURL, os.Getenv(migration.AllowLocalSeedEnv) == "1"); err != nil {
+			slog.Error("seed refused", slog.String("error", err.Error()))
+			os.Exit(1)
+		}
+	}
 	if err := migration.Run(databaseURL, *directory, *action, *steps); err != nil {
 		slog.Error("migration failed", slog.String("error", err.Error()))
 		os.Exit(1)
 	}
 	if !*seed {
 		return
-	}
-	if *action != "up" {
-		slog.Error("seed requires up migration action")
-		os.Exit(1)
 	}
 
 	configuration, err := config.Load()

@@ -18,9 +18,19 @@ import (
 type userContextKey struct{}
 
 func Authenticate(jwtSecret string, expectedIssuer string, expectedAudience string, collector *metrics.MetricsCollector) gin.HandlerFunc {
-	secretBytes := []byte(jwtSecret)
+	return AuthenticateWithKeyProvider(domain.NewStaticKeyProvider("v1", jwtSecret, nil), expectedIssuer, expectedAudience, collector)
+}
 
+func AuthenticateWithKeyProvider(keyProvider domain.KeyProvider, expectedIssuer string, expectedAudience string, collector *metrics.MetricsCollector) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		if keyProvider == nil {
+			if collector != nil {
+				collector.RecordAuthFailure("unauthorized")
+			}
+			response.WriteError(c.Writer, RequestIDFromContext(c.Request.Context()), domain.Unauthorized())
+			c.Abort()
+			return
+		}
 		authHeader := c.GetHeader("Authorization")
 		if authHeader == "" {
 			if collector != nil {
@@ -42,14 +52,68 @@ func Authenticate(jwtSecret string, expectedIssuer string, expectedAudience stri
 		}
 
 		tokenString := strings.TrimSpace(parts[1])
-		token, err := jwt.Parse(tokenString, func(t *jwt.Token) (interface{}, error) {
-			if t.Method.Alg() != jwt.SigningMethodHS256.Alg() {
-				return nil, fmt.Errorf("unexpected signing algorithm: %v", t.Header["alg"])
-			}
-			return secretBytes, nil
-		})
+		parseTokenWithSecret := func(sec []byte) (*jwt.Token, error) {
+			return jwt.Parse(tokenString, func(t *jwt.Token) (interface{}, error) {
+				if t.Method.Alg() != jwt.SigningMethodHS256.Alg() {
+					return nil, fmt.Errorf("unexpected signing algorithm: %v", t.Header["alg"])
+				}
+				return sec, nil
+			})
+		}
 
-		if err != nil || token == nil || !token.Valid {
+		var token *jwt.Token
+		var parseErr error
+
+		var kid string
+		hasKid := false
+		if rawToken, _, err := new(jwt.Parser).ParseUnverified(tokenString, jwt.MapClaims{}); err == nil {
+			if rawKid, exists := rawToken.Header["kid"]; exists {
+				parsedKid, ok := rawKid.(string)
+				if !ok {
+					if collector != nil {
+						collector.RecordAuthFailure("unauthorized")
+					}
+					response.WriteError(c.Writer, RequestIDFromContext(c.Request.Context()), domain.Unauthorized())
+					c.Abort()
+					return
+				}
+				kid = parsedKid
+				hasKid = true
+			}
+		}
+
+		if hasKid {
+			secret, ok := keyProvider.GetKey(kid)
+			if !ok {
+				if collector != nil {
+					collector.RecordAuthFailure("unauthorized")
+				}
+				response.WriteError(c.Writer, RequestIDFromContext(c.Request.Context()), domain.Unauthorized())
+				c.Abort()
+				return
+			}
+			token, parseErr = parseTokenWithSecret(secret)
+		} else {
+			// Legacy token without kid header claim: try active key first, then fallback to legacy keys
+			activeKid, activeSecret := keyProvider.ActiveKey()
+			if len(activeSecret) > 0 {
+				token, parseErr = parseTokenWithSecret(activeSecret)
+			}
+			if parseErr != nil || token == nil || !token.Valid {
+				for k, secret := range keyProvider.AllKeys() {
+					if k == activeKid {
+						continue
+					}
+					if t, err := parseTokenWithSecret(secret); err == nil && t != nil && t.Valid {
+						token = t
+						parseErr = nil
+						break
+					}
+				}
+			}
+		}
+
+		if parseErr != nil || token == nil || !token.Valid {
 			if collector != nil {
 				collector.RecordAuthFailure("unauthorized")
 			}

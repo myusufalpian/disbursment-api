@@ -57,6 +57,10 @@ func (h *DisbursementHandler) Create(c *gin.Context) {
 	}
 
 	idempotencyKey := c.GetHeader("Idempotency-Key")
+	if idempotencyKey == "" {
+		response.WriteError(c.Writer, reqIDStr, domain.InvalidIdempotencyKey())
+		return
+	}
 
 	input := domain.CreateDisbursementInput{
 		RecipientName: req.RecipientName,

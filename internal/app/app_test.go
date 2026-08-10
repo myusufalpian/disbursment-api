@@ -41,7 +41,7 @@ func (lifecycleRelayStore) RecordFailure(context.Context, uuid.UUID, string, tim
 	return nil
 }
 
-func (lifecycleRelayStore) ReconcilePending(context.Context, time.Duration) (int, int, error) {
+func (lifecycleRelayStore) ReconcilePending(context.Context, time.Duration, time.Duration) (int, int, error) {
 	return 0, 0, nil
 }
 
@@ -76,7 +76,7 @@ func TestApplicationLifecycleRunAndShutdown(t *testing.T) {
 	relayStore := lifecycleRelayStore{}
 	collector := metrics.NewMetricsCollector()
 
-	relayService, err := audit.NewRelayService(&relayStore, &relayStore, collector, logger)
+	relayService, err := audit.NewRelayService(&relayStore, &relayStore, collector, logger, audit.RelayConfig{OutboxRetention: 30 * 24 * time.Hour, WarningAge: 5 * time.Minute, CriticalAge: 15 * time.Minute})
 	if err != nil {
 		t.Fatalf("failed to create relay service: %v", err)
 	}
@@ -192,7 +192,7 @@ func TestNewErrorBranches(t *testing.T) {
 		}
 
 		metricsCollector := metrics.NewMetricsCollector()
-		_, err := httpapi.NewRouter(cfg.HTTP.MaxRequestBodyBytes, logger, "secret", "iss", "aud", nil, nil, metricsCollector, "token", cfg.HTTP.TrustedProxies)
+		_, err := httpapi.NewRouter(cfg.HTTP.MaxRequestBodyBytes, logger, domain.NewStaticKeyProvider("v1", "secret", nil), "iss", "aud", nil, nil, metricsCollector, "token", cfg.HTTP.TrustedProxies, nil)
 		if err == nil {
 			t.Fatalf("expected router error for invalid trusted proxy")
 		}

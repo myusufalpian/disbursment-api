@@ -50,7 +50,7 @@ func (m *mockAuditOutboxStore) RecordFailure(ctx context.Context, eventID uuid.U
 	return nil
 }
 
-func (m *mockAuditOutboxStore) ReconcilePending(ctx context.Context, minAge time.Duration) (int, int, error) {
+func (m *mockAuditOutboxStore) ReconcilePending(ctx context.Context, minAge time.Duration, criticalAge time.Duration) (int, int, error) {
 	if m.reconcilePendingFunc != nil {
 		return m.reconcilePendingFunc(ctx, minAge)
 	}
@@ -109,17 +109,17 @@ func TestNewRelayServiceConstructor(t *testing.T) {
 	projection := &mockAuditProjectionStore{}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
-	_, err := NewRelayService(nil, projection, nil, logger)
+	_, err := NewRelayService(nil, projection, nil, logger, RelayConfig{OutboxRetention: 30 * 24 * time.Hour, WarningAge: 5 * time.Minute, CriticalAge: 15 * time.Minute})
 	if err == nil {
 		t.Fatalf("expected error for nil outbox store")
 	}
 
-	_, err = NewRelayService(outbox, nil, nil, logger)
+	_, err = NewRelayService(outbox, nil, nil, logger, RelayConfig{OutboxRetention: 30 * 24 * time.Hour, WarningAge: 5 * time.Minute, CriticalAge: 15 * time.Minute})
 	if err == nil {
 		t.Fatalf("expected error for nil projection store")
 	}
 
-	service, err := NewRelayService(outbox, projection, nil, nil)
+	service, err := NewRelayService(outbox, projection, nil, nil, RelayConfig{OutboxRetention: 30 * 24 * time.Hour, WarningAge: 5 * time.Minute, CriticalAge: 15 * time.Minute})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -138,7 +138,7 @@ func TestRelayService_ProcessBatch(t *testing.T) {
 			},
 		}
 		metrics := &mockMetricsReporter{}
-		service, _ := NewRelayService(outbox, &mockAuditProjectionStore{}, metrics, logger)
+		service, _ := NewRelayService(outbox, &mockAuditProjectionStore{}, metrics, logger, RelayConfig{OutboxRetention: 30 * 24 * time.Hour, WarningAge: 5 * time.Minute, CriticalAge: 15 * time.Minute})
 
 		count, err := service.ProcessBatch(context.Background(), 10)
 		if err != nil {
@@ -158,7 +158,7 @@ func TestRelayService_ProcessBatch(t *testing.T) {
 				return nil, errors.New("db query failed")
 			},
 		}
-		service, _ := NewRelayService(outbox, &mockAuditProjectionStore{}, nil, logger)
+		service, _ := NewRelayService(outbox, &mockAuditProjectionStore{}, nil, logger, RelayConfig{OutboxRetention: 30 * 24 * time.Hour, WarningAge: 5 * time.Minute, CriticalAge: 15 * time.Minute})
 		_, err := service.ProcessBatch(context.Background(), 10)
 		if err == nil {
 			t.Fatalf("expected error for fetch failure")
@@ -201,7 +201,7 @@ func TestRelayService_ProcessBatch(t *testing.T) {
 		}
 
 		metrics := &mockMetricsReporter{}
-		service, _ := NewRelayService(outbox, projection, metrics, logger)
+		service, _ := NewRelayService(outbox, projection, metrics, logger, RelayConfig{OutboxRetention: 30 * 24 * time.Hour, WarningAge: 5 * time.Minute, CriticalAge: 15 * time.Minute})
 
 		count, err := service.ProcessBatch(context.Background(), 10)
 		if err != nil {
@@ -250,7 +250,7 @@ func TestRelayService_ProcessBatch(t *testing.T) {
 		}
 
 		metrics := &mockMetricsReporter{}
-		service, _ := NewRelayService(outbox, projection, metrics, logger)
+		service, _ := NewRelayService(outbox, projection, metrics, logger, RelayConfig{OutboxRetention: 30 * 24 * time.Hour, WarningAge: 5 * time.Minute, CriticalAge: 15 * time.Minute})
 
 		count, err := service.ProcessBatch(context.Background(), 10)
 		if err != nil {
@@ -278,7 +278,7 @@ func TestRelayService_ReconcileAndCleanup(t *testing.T) {
 			},
 		}
 		metrics := &mockMetricsReporter{}
-		service, _ := NewRelayService(outbox, &mockAuditProjectionStore{}, metrics, logger)
+		service, _ := NewRelayService(outbox, &mockAuditProjectionStore{}, metrics, logger, RelayConfig{OutboxRetention: 30 * 24 * time.Hour, WarningAge: 5 * time.Minute, CriticalAge: 15 * time.Minute})
 
 		report, err := service.Reconcile(context.Background())
 		if err != nil {
@@ -298,7 +298,7 @@ func TestRelayService_ReconcileAndCleanup(t *testing.T) {
 				return 0, 0, errors.New("reconcile db error")
 			},
 		}
-		service, _ := NewRelayService(outbox, &mockAuditProjectionStore{}, nil, logger)
+		service, _ := NewRelayService(outbox, &mockAuditProjectionStore{}, nil, logger, RelayConfig{OutboxRetention: 30 * 24 * time.Hour, WarningAge: 5 * time.Minute, CriticalAge: 15 * time.Minute})
 		_, err := service.Reconcile(context.Background())
 		if err == nil {
 			t.Fatalf("expected error for reconcile failure")
@@ -311,8 +311,8 @@ func TestRelayService_ReconcileAndCleanup(t *testing.T) {
 				return 42, nil
 			},
 		}
-		service, _ := NewRelayService(outbox, &mockAuditProjectionStore{}, nil, logger)
-		cleaned, err := service.Cleanup(context.Background(), 30)
+		service, _ := NewRelayService(outbox, &mockAuditProjectionStore{}, nil, logger, RelayConfig{OutboxRetention: 30 * 24 * time.Hour, WarningAge: 5 * time.Minute, CriticalAge: 15 * time.Minute})
+		cleaned, err := service.Cleanup(context.Background())
 		if err != nil {
 			t.Fatalf("Cleanup failed: %v", err)
 		}
@@ -372,7 +372,7 @@ func TestRelayService_StartAndStopWorker(t *testing.T) {
 		},
 	}
 
-	service, err := NewRelayService(outbox, projection, nil, logger)
+	service, err := NewRelayService(outbox, projection, nil, logger, RelayConfig{OutboxRetention: 30 * 24 * time.Hour, WarningAge: 5 * time.Minute, CriticalAge: 15 * time.Minute})
 	if err != nil {
 		t.Fatalf("failed to create relay service: %v", err)
 	}
@@ -425,7 +425,7 @@ func TestRelayService_EdgeCases(t *testing.T) {
 				return []domain.AuditEvent{event, event}, nil
 			},
 		}
-		service, _ := NewRelayService(outbox, &mockAuditProjectionStore{}, nil, logger)
+		service, _ := NewRelayService(outbox, &mockAuditProjectionStore{}, nil, logger, RelayConfig{OutboxRetention: 30 * 24 * time.Hour, WarningAge: 5 * time.Minute, CriticalAge: 15 * time.Minute})
 
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
@@ -455,7 +455,7 @@ func TestRelayService_EdgeCases(t *testing.T) {
 			},
 		}
 		metrics := &mockMetricsReporter{}
-		service, _ := NewRelayService(outbox, &mockAuditProjectionStore{}, metrics, logger)
+		service, _ := NewRelayService(outbox, &mockAuditProjectionStore{}, metrics, logger, RelayConfig{OutboxRetention: 30 * 24 * time.Hour, WarningAge: 5 * time.Minute, CriticalAge: 15 * time.Minute})
 
 		count, err := service.ProcessBatch(context.Background(), 10)
 		if err != nil {
@@ -492,7 +492,7 @@ func TestRelayService_EdgeCases(t *testing.T) {
 				return errors.New("projection failed")
 			},
 		}
-		service, _ := NewRelayService(outbox, projection, nil, logger)
+		service, _ := NewRelayService(outbox, projection, nil, logger, RelayConfig{OutboxRetention: 30 * 24 * time.Hour, WarningAge: 5 * time.Minute, CriticalAge: 15 * time.Minute})
 
 		count, err := service.ProcessBatch(context.Background(), 10)
 		if err != nil {
@@ -549,7 +549,7 @@ func TestRelayService_EdgeCases(t *testing.T) {
 				return nil
 			},
 		}
-		service, err := NewRelayService(outbox, projection, nil, logger)
+		service, err := NewRelayService(outbox, projection, nil, logger, RelayConfig{OutboxRetention: 30 * 24 * time.Hour, WarningAge: 5 * time.Minute, CriticalAge: 15 * time.Minute})
 		if err != nil {
 			t.Fatalf("failed to create relay service: %v", err)
 		}
@@ -623,7 +623,7 @@ func TestRelayService_EdgeCases(t *testing.T) {
 				return 0, nil
 			},
 		}
-		service, err := NewRelayService(outbox, &mockAuditProjectionStore{}, nil, logger)
+		service, err := NewRelayService(outbox, &mockAuditProjectionStore{}, nil, logger, RelayConfig{OutboxRetention: 30 * 24 * time.Hour, WarningAge: 5 * time.Minute, CriticalAge: 15 * time.Minute})
 		if err != nil {
 			t.Fatalf("failed to create relay service: %v", err)
 		}
@@ -747,7 +747,7 @@ func (f *statefulRelayFake) advance(duration time.Duration) {
 	f.now = f.now.Add(duration)
 }
 
-func (f *statefulRelayFake) ReconcilePending(ctx context.Context, minAge time.Duration) (int, int, error) {
+func (f *statefulRelayFake) ReconcilePending(ctx context.Context, minAge time.Duration, criticalAge time.Duration) (int, int, error) {
 	return 0, 0, nil
 }
 
@@ -801,7 +801,7 @@ func TestRelayService_RestartRetriesFailedProjection(t *testing.T) {
 		OccurredAt: time.Date(2026, time.August, 9, 7, 0, 0, 0, time.UTC),
 	}
 	fake := newStatefulRelayFake(event)
-	firstService, err := NewRelayService(fake, fake, nil, logger)
+	firstService, err := NewRelayService(fake, fake, nil, logger, RelayConfig{OutboxRetention: 30 * 24 * time.Hour, WarningAge: 5 * time.Minute, CriticalAge: 15 * time.Minute})
 	if err != nil {
 		t.Fatalf("failed to create first relay service: %v", err)
 	}
@@ -832,7 +832,7 @@ func TestRelayService_RestartRetriesFailedProjection(t *testing.T) {
 	}
 	fake.makeAvailable(event.EventID)
 
-	secondService, err := NewRelayService(fake, fake, nil, logger)
+	secondService, err := NewRelayService(fake, fake, nil, logger, RelayConfig{OutboxRetention: 30 * 24 * time.Hour, WarningAge: 5 * time.Minute, CriticalAge: 15 * time.Minute})
 	if err != nil {
 		t.Fatalf("failed to create restarted relay service: %v", err)
 	}
@@ -883,7 +883,7 @@ func TestRelayService_RetriesAfterMarkDeliveredFailure(t *testing.T) {
 	fake := newStatefulRelayFake(event)
 	fake.failFirstProjection = false
 	fake.failFirstMark = true
-	service, err := NewRelayService(fake, fake, nil, logger)
+	service, err := NewRelayService(fake, fake, nil, logger, RelayConfig{OutboxRetention: 30 * 24 * time.Hour, WarningAge: 5 * time.Minute, CriticalAge: 15 * time.Minute})
 	if err != nil {
 		t.Fatalf("failed to create relay service: %v", err)
 	}
@@ -929,5 +929,93 @@ func TestRelayService_RetriesAfterMarkDeliveredFailure(t *testing.T) {
 	}
 	if fake.lastDeliveryError[event.EventID] != "" {
 		t.Fatalf("expected delivery error to clear after successful retry, got %q", fake.lastDeliveryError[event.EventID])
+	}
+}
+
+func TestRelayService_StartWorkerStopWorkerAndCleanup(t *testing.T) {
+	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
+
+	t.Run("Cleanup passes correct retention parameter and returns deleted count", func(t *testing.T) {
+		var receivedOlderThan time.Duration
+		outboxStore := &mockAuditOutboxStore{
+			cleanupDeliveredFunc: func(ctx context.Context, olderThan time.Duration) (int64, error) {
+				receivedOlderThan = olderThan
+				return 5, nil
+			},
+		}
+		service, err := NewRelayService(outboxStore, &mockAuditProjectionStore{}, nil, logger, RelayConfig{OutboxRetention: 30 * 24 * time.Hour, WarningAge: 5 * time.Minute, CriticalAge: 15 * time.Minute})
+		if err != nil {
+			t.Fatalf("failed to create relay service: %v", err)
+		}
+
+		count, err := service.Cleanup(context.Background())
+		if err != nil || count != 5 {
+			t.Fatalf("expected cleanup count 5, got count=%d err=%v", count, err)
+		}
+		expectedRetention := 30 * 24 * time.Hour
+		if receivedOlderThan != expectedRetention {
+			t.Fatalf("expected cleanup retention duration %v, got %v", expectedRetention, receivedOlderThan)
+		}
+	})
+
+	t.Run("Cleanup error handling", func(t *testing.T) {
+		outboxStoreErr := &mockAuditOutboxStore{
+			cleanupDeliveredFunc: func(ctx context.Context, olderThan time.Duration) (int64, error) {
+				return 0, errors.New("cleanup error")
+			},
+		}
+		serviceErr, _ := NewRelayService(outboxStoreErr, &mockAuditProjectionStore{}, nil, logger, RelayConfig{OutboxRetention: 30 * 24 * time.Hour, WarningAge: 5 * time.Minute, CriticalAge: 15 * time.Minute})
+		_, err := serviceErr.Cleanup(context.Background())
+		if err == nil {
+			t.Fatal("expected error on cleanup failure, got nil")
+		}
+	})
+
+	t.Run("StartWorker lifecycle and double start prevention", func(t *testing.T) {
+		workerFetched := make(chan struct{}, 1)
+		outboxStore := &mockAuditOutboxStore{
+			fetchPendingFunc: func(ctx context.Context, limit int) ([]domain.AuditEvent, error) {
+				select {
+				case workerFetched <- struct{}{}:
+				default:
+				}
+				return nil, nil
+			},
+		}
+		service, _ := NewRelayService(outboxStore, &mockAuditProjectionStore{}, nil, logger, RelayConfig{OutboxRetention: 30 * 24 * time.Hour, WarningAge: 5 * time.Minute, CriticalAge: 15 * time.Minute})
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		if err := service.StartWorker(ctx, 10*time.Millisecond, 10); err != nil {
+			t.Fatalf("failed to start worker: %v", err)
+		}
+
+		waitForRelaySignal(t, workerFetched, "worker initial fetch")
+
+		// Double start should fail
+		if err := service.StartWorker(ctx, 10*time.Millisecond, 10); err == nil {
+			t.Fatal("expected error starting already running worker")
+		}
+
+		stopRelayWorker(t, service)
+
+		// Double stop should be safe
+		service.StopWorker()
+	})
+}
+
+func TestRelayService_stopWorker_EdgeCases(t *testing.T) {
+	service := &RelayService{}
+	// Direct call to unexported method should safely return when not running
+	service.stopWorker()
+	service.StopWorker()
+}
+
+func TestEventIdentityHelper(t *testing.T) {
+	helper := EventIdentityHelper{}
+	id := helper.GenerateID()
+	if id == uuid.Nil {
+		t.Fatal("expected non-nil uuid")
 	}
 }

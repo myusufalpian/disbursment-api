@@ -15,6 +15,129 @@ import (
 	"github.com/google/uuid"
 )
 
+func TestAuthenticateWithKeyProvider_BehavioralRotationCases(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	activeKeyID := "v2"
+	activeSecret := "secret-key-v2"
+	legacySecret := "secret-key-v1"
+
+	keyProvider := domain.NewStaticKeyProvider(activeKeyID, activeSecret, map[string]string{
+		"v1": legacySecret,
+	})
+
+	issuer := "disbursement-api"
+	audience := "disbursement-api-users"
+	authMiddleware := AuthenticateWithKeyProvider(keyProvider, issuer, audience, nil)
+
+	buildRouter := func() *gin.Engine {
+		r := gin.New()
+		r.Use(authMiddleware)
+		r.GET("/test", func(c *gin.Context) {
+			c.Status(http.StatusOK)
+		})
+		return r
+	}
+
+	userID := uuid.New()
+
+	makeToken := func(signKey string, headerKid interface{}, isLegacyNoKid bool) string {
+		claims := jwt.MapClaims{
+			"sub":      userID.String(),
+			"username": "testuser",
+			"role":     "OPERATOR",
+			"iss":      issuer,
+			"aud":      audience,
+			"exp":      time.Now().Add(15 * time.Minute).Unix(),
+		}
+		token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+		if headerKid != nil {
+			token.Header["kid"] = headerKid
+		}
+		tokenString, _ := token.SignedString([]byte(signKey))
+		return tokenString
+	}
+
+	tests := []struct {
+		name           string
+		token          string
+		expectedStatus int
+	}{
+		{
+			name:           "active key v2 with kid: v2 -> 200 OK",
+			token:          makeToken(activeSecret, "v2", false),
+			expectedStatus: http.StatusOK,
+		},
+		{
+			name:           "legacy key v1 with kid: v1 during rotation window -> 200 OK",
+			token:          makeToken(legacySecret, "v1", false),
+			expectedStatus: http.StatusOK,
+		},
+		{
+			name:           "legacy token without kid claim -> 200 OK via fallback",
+			token:          makeToken(legacySecret, nil, true),
+			expectedStatus: http.StatusOK,
+		},
+		{
+			name:           "unknown kid v0 -> 401 UNAUTHORIZED",
+			token:          makeToken(activeSecret, "v0", false),
+			expectedStatus: http.StatusUnauthorized,
+		},
+		{
+			name:           "non-string kid header type (integer 123) -> 401 UNAUTHORIZED",
+			token:          makeToken(activeSecret, 123, false),
+			expectedStatus: http.StatusUnauthorized,
+		},
+		{
+			name:           "legacy token without kid claim but signed with unknown secret -> 401 UNAUTHORIZED",
+			token:          makeToken("unknown-secret", nil, true),
+			expectedStatus: http.StatusUnauthorized,
+		},
+		{
+			name:           "valid kid but invalid signature (wrong secret) -> 401 UNAUTHORIZED",
+			token:          makeToken("wrong-secret-for-v2", "v2", false),
+			expectedStatus: http.StatusUnauthorized,
+		},
+	}
+
+	router := buildRouter()
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			req, _ := http.NewRequest(http.MethodGet, "/test", nil)
+			req.Header.Set("Authorization", "Bearer "+tt.token)
+
+			router.ServeHTTP(w, req)
+
+			if w.Code != tt.expectedStatus {
+				t.Fatalf("expected status %d, got %d", tt.expectedStatus, w.Code)
+			}
+		})
+	}
+}
+
+func TestAuthenticateWithKeyProvider_NilKeyProviderFailClosed(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	authMiddleware := AuthenticateWithKeyProvider(nil, "issuer", "audience", nil)
+
+	r := gin.New()
+	r.Use(authMiddleware)
+	r.GET("/test", func(c *gin.Context) {
+		c.Status(http.StatusOK)
+	})
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodGet, "/test", nil)
+	req.Header.Set("Authorization", "Bearer valid-looking-token")
+
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 fail-closed for nil keyProvider, got %d", w.Code)
+	}
+}
+
 const middlewareRequestID = "990e8400-e29b-41d4-a716-446655440000"
 
 func fixedMiddlewareTime() time.Time {

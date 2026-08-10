@@ -139,7 +139,7 @@ func newAuthServiceFixture(t *testing.T) (*Service, *mockUserStore, *mockSession
 	userStore.users[user.Username] = user
 	userStore.byID[user.ID] = user
 
-	authService := NewServiceWithIssuerAudience(
+	authService, err := NewServiceWithIssuerAudience(
 		userStore,
 		sessionStore,
 		&mockTransactor{},
@@ -150,6 +150,9 @@ func newAuthServiceFixture(t *testing.T) (*Service, *mockUserStore, *mockSession
 		testRefreshTokenTTL,
 		nil,
 	)
+	if err != nil {
+		t.Fatalf("failed to create auth service fixture: %v", err)
+	}
 	authService.nowFunc = fixedAuthTime
 	return authService, userStore, sessionStore, user, password
 }
@@ -197,9 +200,14 @@ func assertAccessTokenClaims(t *testing.T, tokenString string, user repository.U
 	}
 }
 
-type mockTransactor struct{}
+type mockTransactor struct {
+	errToReturn error
+}
 
 func (m *mockTransactor) WithinTransaction(ctx context.Context, fn func(context.Context, repository.Transaction) error) error {
+	if m.errToReturn != nil {
+		return m.errToReturn
+	}
 	return fn(ctx, nil)
 }
 
@@ -248,7 +256,7 @@ func TestAuthService_Login(t *testing.T) {
 	t.Run("database error on find by username returns error", func(t *testing.T) {
 		userStore := newMockUserStore()
 		userStore.errToReturn = errors.New("db connection failure")
-		svc := NewService(userStore, newMockSessionStore(), &mockTransactor{}, testJWTSecret, testAccessTokenTTL, testRefreshTokenTTL, nil)
+		svc, _ := NewService(userStore, newMockSessionStore(), &mockTransactor{}, testJWTSecret, testAccessTokenTTL, testRefreshTokenTTL, nil)
 		_, err := svc.Login(context.Background(), dto.LoginRequest{Username: "test", Password: "pwd"})
 		if err == nil {
 			t.Error("expected error on user store failure")
@@ -358,7 +366,84 @@ func TestAuthService_Refresh(t *testing.T) {
 		authService.sessionStore = errSessionStore
 		_, err := authService.Refresh(context.Background(), dto.RefreshRequest{RefreshToken: "valid-token"})
 		if err == nil {
-			t.Error("expected error on session find failure")
+			t.Fatal("expected error on FindByID failure, got nil")
+		}
+	})
+
+	t.Run("refresh revoked session returns INVALID_REFRESH_TOKEN", func(t *testing.T) {
+		authService, _, sessionStore, user, _ := newAuthServiceFixture(t)
+		refreshToken := "refresh-token-revoked"
+		hash := hashToken(refreshToken)
+		now := fixedAuthTime()
+		sessionStore.sessions[hash] = repository.RefreshSession{
+			ID:        uuid.New(),
+			UserID:    user.ID,
+			TokenHash: hash,
+			ExpiresAt: now.Add(time.Hour),
+			RevokedAt: &now,
+		}
+		_, err := authService.Refresh(context.Background(), dto.RefreshRequest{RefreshToken: refreshToken})
+		if domain.AsError(err).Code != domain.CodeInvalidRefreshToken {
+			t.Fatalf("expected INVALID_REFRESH_TOKEN, got %v", err)
+		}
+	})
+
+	t.Run("refresh expired session returns INVALID_REFRESH_TOKEN", func(t *testing.T) {
+		authService, _, sessionStore, user, _ := newAuthServiceFixture(t)
+		refreshToken := "refresh-token-expired"
+		hash := hashToken(refreshToken)
+		sessionStore.sessions[hash] = repository.RefreshSession{
+			ID:        uuid.New(),
+			UserID:    user.ID,
+			TokenHash: hash,
+			ExpiresAt: fixedAuthTime().Add(-time.Hour), // Expired
+		}
+		_, err := authService.Refresh(context.Background(), dto.RefreshRequest{RefreshToken: refreshToken})
+		if domain.AsError(err).Code != domain.CodeInvalidRefreshToken {
+			t.Fatalf("expected INVALID_REFRESH_TOKEN, got %v", err)
+		}
+	})
+
+	t.Run("refresh session generic db error propagates", func(t *testing.T) {
+		authService, _, sessionStore, _, _ := newAuthServiceFixture(t)
+		sessionStore.errToReturn = errors.New("generic db error")
+		_, err := authService.Refresh(context.Background(), dto.RefreshRequest{RefreshToken: "any"})
+		if err == nil || err.Error() != "generic db error" {
+			t.Fatalf("expected generic db error, got %v", err)
+		}
+	})
+
+	t.Run("Refresh error propagates from session store Rotate", func(t *testing.T) {
+		authService, _, sessionStore, user, _ := newAuthServiceFixture(t)
+		refreshToken := "refresh-token-rotate-error"
+		hash := hashToken(refreshToken)
+		sessionStore.sessions[hash] = repository.RefreshSession{
+			ID:        uuid.New(),
+			UserID:    user.ID,
+			TokenHash: hash,
+			ExpiresAt: fixedAuthTime().Add(time.Hour),
+		}
+		sessionStore.errToReturn = errors.New("db error")
+		_, err := authService.Refresh(context.Background(), dto.RefreshRequest{RefreshToken: refreshToken})
+		if err == nil {
+			t.Fatalf("expected error from Rotate, got nil")
+		}
+	})
+
+	t.Run("transaction failure in refresh propagates", func(t *testing.T) {
+		authService, _, sessionStore, user, _ := newAuthServiceFixture(t)
+		refreshToken := "refresh-tx-error"
+		hash := hashToken(refreshToken)
+		sessionStore.sessions[hash] = repository.RefreshSession{
+			ID:        uuid.New(),
+			UserID:    user.ID,
+			TokenHash: hash,
+			ExpiresAt: fixedAuthTime().Add(time.Hour),
+		}
+		authService.transactor = &mockTransactor{errToReturn: errors.New("tx failure")}
+		_, err := authService.Refresh(context.Background(), dto.RefreshRequest{RefreshToken: refreshToken})
+		if err == nil || err.Error() != "tx failure" {
+			t.Errorf("expected tx failure error, got %v", err)
 		}
 	})
 }
@@ -406,6 +491,134 @@ func TestAuthService_Logout(t *testing.T) {
 		err := authService.Logout(context.Background(), dto.LogoutRequest{RefreshToken: "valid-token"})
 		if err == nil {
 			t.Fatalf("expected error on logout db failure, got nil")
+		}
+	})
+
+	t.Run("NewServiceWithKeyProvider fail closed on nil or empty secret keyProvider", func(t *testing.T) {
+		_, err := NewServiceWithKeyProvider(
+			nil,
+			newMockSessionStore(),
+			&mockTransactor{},
+			domain.NewStaticKeyProvider("v1", testJWTSecret, nil),
+			"",
+			"",
+			15*time.Minute,
+			7*24*time.Hour,
+			nil,
+		)
+		if err == nil {
+			t.Fatal("expected error on nil userStore, got nil")
+		}
+
+		_, err = NewServiceWithKeyProvider(
+			newMockUserStore(),
+			newMockSessionStore(),
+			&mockTransactor{},
+			nil,
+			"",
+			"",
+			15*time.Minute,
+			7*24*time.Hour,
+			nil,
+		)
+		if err == nil {
+			t.Fatal("expected error on nil keyProvider, got nil")
+		}
+
+		emptyProvider := domain.NewStaticKeyProvider("v1", "", nil)
+		_, err = NewServiceWithKeyProvider(
+			newMockUserStore(),
+			newMockSessionStore(),
+			&mockTransactor{},
+			emptyProvider,
+			"",
+			"",
+			15*time.Minute,
+			7*24*time.Hour,
+			nil,
+		)
+		if err == nil {
+			t.Fatal("expected error on empty keyProvider active secret, got nil")
+		}
+	})
+
+	t.Run("Login issues JWT with active key kid header claim", func(t *testing.T) {
+		keyProvider := domain.NewStaticKeyProvider("v2", "secret-v2", nil)
+		userStore := newMockUserStore()
+		sessionStore := newMockSessionStore()
+		password := "password123"
+		hashedPassword, _ := bcrypt.GenerateFromPassword([]byte(password), bcrypt.MinCost)
+
+		user := repository.User{
+			ID:           uuid.New(),
+			Username:     "rotuser",
+			PasswordHash: string(hashedPassword),
+			Role:         "ADMIN",
+		}
+		userStore.users[user.Username] = user
+		userStore.byID[user.ID] = user
+
+		svc, err := NewServiceWithKeyProvider(
+			userStore,
+			sessionStore,
+			&mockTransactor{},
+			keyProvider,
+			"test-iss",
+			"test-aud",
+			15*time.Minute,
+			7*24*time.Hour,
+			nil,
+		)
+		if err != nil {
+			t.Fatalf("failed to create service: %v", err)
+		}
+
+		resp, err := svc.Login(context.Background(), dto.LoginRequest{Username: "rotuser", Password: password})
+		if err != nil {
+			t.Fatalf("login failed: %v", err)
+		}
+
+		parsedToken, err := jwt.Parse(resp.AccessToken, func(token *jwt.Token) (interface{}, error) {
+			return []byte("secret-v2"), nil
+		})
+		if err != nil || !parsedToken.Valid {
+			t.Fatalf("failed to parse issued access token: %v", err)
+		}
+		if kid, ok := parsedToken.Header["kid"].(string); !ok || kid != "v2" {
+			t.Fatalf("expected JWT header kid='v2', got %v", parsedToken.Header["kid"])
+		}
+	})
+
+	t.Run("Login database error propagates repository error", func(t *testing.T) {
+		userStore := newMockUserStore()
+		userStore.errToReturn = errors.New("internal database error")
+		svc, _ := NewService(userStore, newMockSessionStore(), &mockTransactor{}, "secret", 15*time.Minute, 7*24*time.Hour, nil)
+
+		_, err := svc.Login(context.Background(), dto.LoginRequest{Username: "user", Password: "pwd"})
+		if err == nil || err.Error() != "internal database error" {
+			t.Fatalf("expected internal database error, got %v", err)
+		}
+	})
+
+	t.Run("Refresh user not found error returns InvalidRefreshToken", func(t *testing.T) {
+		authService, userStore, sessionStore, _, _ := newAuthServiceFixture(t)
+		sessionID := uuid.New()
+		userID := uuid.New()
+		rawToken := "valid-refresh"
+		tokenHash := hashToken(rawToken)
+
+		sessionStore.sessions[tokenHash] = repository.RefreshSession{
+			ID:        sessionID,
+			UserID:    userID,
+			TokenHash: tokenHash,
+			ExpiresAt: time.Now().Add(1 * time.Hour),
+		}
+
+		delete(userStore.byID, userID)
+
+		_, err := authService.Refresh(context.Background(), dto.RefreshRequest{RefreshToken: rawToken})
+		if err == nil || domain.AsError(err).Code != domain.CodeInvalidRefreshToken {
+			t.Fatalf("expected INVALID_REFRESH_TOKEN when user not found, got %v", err)
 		}
 	})
 }

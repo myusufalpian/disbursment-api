@@ -334,6 +334,58 @@ func TestReleaseGateLocalHostSafety(t *testing.T) {
 	}
 }
 
+func TestMigrationSeedTargetRequiresExplicitAuthorizationAndLoopback(t *testing.T) {
+	tests := []struct {
+		name       string
+		dsn        string
+		authorized bool
+		wantErr    string
+	}{
+		{
+			name:    "authorization is required even for loopback",
+			dsn:     "postgres://postgres:postgres@localhost:5432/disbursement_api_release_gate_test",
+			wantErr: "seeding fixed-credential accounts requires ALLOW_LOCAL_SEED=1",
+		},
+		{
+			name:       "authorized localhost with trailing dot",
+			dsn:        "postgres://postgres:postgres@LOCALHOST.:5432/disbursement_api_release_gate_test",
+			authorized: true,
+		},
+		{
+			name:       "authorized IPv4 loopback",
+			dsn:        "postgres://postgres:postgres@127.0.0.1:5432/disbursement_api_release_gate_test",
+			authorized: true,
+		},
+		{
+			name:       "authorized IPv6 loopback",
+			dsn:        "postgres://postgres:postgres@[::1]:5432/disbursement_api_release_gate_test",
+			authorized: true,
+		},
+		{
+			name:       "authorized remote host is rejected",
+			dsn:        "postgres://postgres:postgres@db.example.test:5432/disbursement_api_release_gate_test",
+			authorized: true,
+			wantErr:    "seed target must be a loopback database host, got \"db.example.test\"",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			// Passing authorization explicitly prevents inherited environment from changing the result.
+			err := migration.AssertLocalSeedTarget(test.dsn, test.authorized)
+			if test.wantErr == "" {
+				if err != nil {
+					t.Fatalf("AssertLocalSeedTarget() error = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil || err.Error() != test.wantErr {
+				t.Fatalf("AssertLocalSeedTarget() error = %v, want %q", err, test.wantErr)
+			}
+		})
+	}
+}
+
 func TestReleaseGateMigrationCleanupDecision(t *testing.T) {
 	version := 1
 	tests := []struct {
@@ -767,11 +819,21 @@ INSERT INTO disbursements (
 		t.Fatalf("insert pending disbursement: %v", err)
 	}
 
+	coordinator, err := idempotency.NewDefaultCoordinator(
+		postgresrepo.NewIdempotencyStore(harness.database),
+		30*time.Second,
+		24*time.Hour,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("create idempotency coordinator: %v", err)
+	}
+
 	service, err := disbursement.NewService(
 		postgresrepo.NewDisbursementStore(harness.database),
 		postgresrepo.NewAuditOutboxStore(harness.database),
 		postgresrepo.NewTransactor(harness.database),
-		nil,
+		coordinator,
 		nil,
 	)
 	if err != nil {
@@ -1049,7 +1111,7 @@ func TestPostgreSQLReleaseGate_RefreshRotationHasSingleWinner(t *testing.T) {
 		t.Fatalf("create seeded user's refresh session: %v", err)
 	}
 
-	authService := auth.NewService(
+	authService, err := auth.NewService(
 		userStore,
 		sessionStore,
 		transactor,
@@ -1058,6 +1120,9 @@ func TestPostgreSQLReleaseGate_RefreshRotationHasSingleWinner(t *testing.T) {
 		7*24*time.Hour,
 		nil,
 	)
+	if err != nil {
+		t.Fatalf("failed to create auth service: %v", err)
+	}
 
 	const concurrentAttempts = 2
 	ready := make(chan struct{}, concurrentAttempts)
