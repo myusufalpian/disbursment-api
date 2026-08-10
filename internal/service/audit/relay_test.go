@@ -999,5 +999,23 @@ func TestRelayService_StartWorkerStopWorkerAndCleanup(t *testing.T) {
 		}
 
 		stopRelayWorker(t, service)
+
+		// Double stop should be safe
+		service.StopWorker()
 	})
+}
+
+func TestRelayService_stopWorker_EdgeCases(t *testing.T) {
+	service := &RelayService{}
+	// Direct call to unexported method should safely return when not running
+	service.stopWorker()
+	service.StopWorker()
+}
+
+func TestEventIdentityHelper(t *testing.T) {
+	helper := EventIdentityHelper{}
+	id := helper.GenerateID()
+	if id == uuid.Nil {
+		t.Fatal("expected non-nil uuid")
+	}
 }

@@ -200,9 +200,14 @@ func assertAccessTokenClaims(t *testing.T, tokenString string, user repository.U
 	}
 }
 
-type mockTransactor struct{}
+type mockTransactor struct {
+	errToReturn error
+}
 
 func (m *mockTransactor) WithinTransaction(ctx context.Context, fn func(context.Context, repository.Transaction) error) error {
+	if m.errToReturn != nil {
+		return m.errToReturn
+	}
 	return fn(ctx, nil)
 }
 
@@ -361,7 +366,84 @@ func TestAuthService_Refresh(t *testing.T) {
 		authService.sessionStore = errSessionStore
 		_, err := authService.Refresh(context.Background(), dto.RefreshRequest{RefreshToken: "valid-token"})
 		if err == nil {
-			t.Error("expected error on session find failure")
+			t.Fatal("expected error on FindByID failure, got nil")
+		}
+	})
+
+	t.Run("refresh revoked session returns INVALID_REFRESH_TOKEN", func(t *testing.T) {
+		authService, _, sessionStore, user, _ := newAuthServiceFixture(t)
+		refreshToken := "refresh-token-revoked"
+		hash := hashToken(refreshToken)
+		now := fixedAuthTime()
+		sessionStore.sessions[hash] = repository.RefreshSession{
+			ID:        uuid.New(),
+			UserID:    user.ID,
+			TokenHash: hash,
+			ExpiresAt: now.Add(time.Hour),
+			RevokedAt: &now,
+		}
+		_, err := authService.Refresh(context.Background(), dto.RefreshRequest{RefreshToken: refreshToken})
+		if domain.AsError(err).Code != domain.CodeInvalidRefreshToken {
+			t.Fatalf("expected INVALID_REFRESH_TOKEN, got %v", err)
+		}
+	})
+
+	t.Run("refresh expired session returns INVALID_REFRESH_TOKEN", func(t *testing.T) {
+		authService, _, sessionStore, user, _ := newAuthServiceFixture(t)
+		refreshToken := "refresh-token-expired"
+		hash := hashToken(refreshToken)
+		sessionStore.sessions[hash] = repository.RefreshSession{
+			ID:        uuid.New(),
+			UserID:    user.ID,
+			TokenHash: hash,
+			ExpiresAt: fixedAuthTime().Add(-time.Hour), // Expired
+		}
+		_, err := authService.Refresh(context.Background(), dto.RefreshRequest{RefreshToken: refreshToken})
+		if domain.AsError(err).Code != domain.CodeInvalidRefreshToken {
+			t.Fatalf("expected INVALID_REFRESH_TOKEN, got %v", err)
+		}
+	})
+
+	t.Run("refresh session generic db error propagates", func(t *testing.T) {
+		authService, _, sessionStore, _, _ := newAuthServiceFixture(t)
+		sessionStore.errToReturn = errors.New("generic db error")
+		_, err := authService.Refresh(context.Background(), dto.RefreshRequest{RefreshToken: "any"})
+		if err == nil || err.Error() != "generic db error" {
+			t.Fatalf("expected generic db error, got %v", err)
+		}
+	})
+
+	t.Run("Refresh error propagates from session store Rotate", func(t *testing.T) {
+		authService, _, sessionStore, user, _ := newAuthServiceFixture(t)
+		refreshToken := "refresh-token-rotate-error"
+		hash := hashToken(refreshToken)
+		sessionStore.sessions[hash] = repository.RefreshSession{
+			ID:        uuid.New(),
+			UserID:    user.ID,
+			TokenHash: hash,
+			ExpiresAt: fixedAuthTime().Add(time.Hour),
+		}
+		sessionStore.errToReturn = errors.New("db error")
+		_, err := authService.Refresh(context.Background(), dto.RefreshRequest{RefreshToken: refreshToken})
+		if err == nil {
+			t.Fatalf("expected error from Rotate, got nil")
+		}
+	})
+
+	t.Run("transaction failure in refresh propagates", func(t *testing.T) {
+		authService, _, sessionStore, user, _ := newAuthServiceFixture(t)
+		refreshToken := "refresh-tx-error"
+		hash := hashToken(refreshToken)
+		sessionStore.sessions[hash] = repository.RefreshSession{
+			ID:        uuid.New(),
+			UserID:    user.ID,
+			TokenHash: hash,
+			ExpiresAt: fixedAuthTime().Add(time.Hour),
+		}
+		authService.transactor = &mockTransactor{errToReturn: errors.New("tx failure")}
+		_, err := authService.Refresh(context.Background(), dto.RefreshRequest{RefreshToken: refreshToken})
+		if err == nil || err.Error() != "tx failure" {
+			t.Errorf("expected tx failure error, got %v", err)
 		}
 	})
 }
@@ -414,6 +496,21 @@ func TestAuthService_Logout(t *testing.T) {
 
 	t.Run("NewServiceWithKeyProvider fail closed on nil or empty secret keyProvider", func(t *testing.T) {
 		_, err := NewServiceWithKeyProvider(
+			nil,
+			newMockSessionStore(),
+			&mockTransactor{},
+			domain.NewStaticKeyProvider("v1", testJWTSecret, nil),
+			"",
+			"",
+			15*time.Minute,
+			7*24*time.Hour,
+			nil,
+		)
+		if err == nil {
+			t.Fatal("expected error on nil userStore, got nil")
+		}
+
+		_, err = NewServiceWithKeyProvider(
 			newMockUserStore(),
 			newMockSessionStore(),
 			&mockTransactor{},
