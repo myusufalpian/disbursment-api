@@ -819,11 +819,21 @@ INSERT INTO disbursements (
 		t.Fatalf("insert pending disbursement: %v", err)
 	}
 
+	coordinator, err := idempotency.NewDefaultCoordinator(
+		postgresrepo.NewIdempotencyStore(harness.database),
+		30*time.Second,
+		24*time.Hour,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("create idempotency coordinator: %v", err)
+	}
+
 	service, err := disbursement.NewService(
 		postgresrepo.NewDisbursementStore(harness.database),
 		postgresrepo.NewAuditOutboxStore(harness.database),
 		postgresrepo.NewTransactor(harness.database),
-		nil,
+		coordinator,
 		nil,
 	)
 	if err != nil {
